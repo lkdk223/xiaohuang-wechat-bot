@@ -2,7 +2,38 @@ import json
 
 import pytest
 
-from backend.core.ai_client import AIClient
+from backend.core.ai_client import AIClient, _collapse_exact_repeated_reply
+
+
+def test_ai_client_collapses_complete_repeated_provider_reply():
+    block = "我先把前因讲清楚，再按时间顺序说后面发生的事。"
+
+    assert _collapse_exact_repeated_reply(f"{block}\n{block}") == block
+
+
+def test_ai_client_keeps_short_intentional_repeat():
+    assert _collapse_exact_repeated_reply("哈哈") == "哈哈"
+
+
+def test_ai_client_does_not_replay_private_history_with_database_memory():
+    client = AIClient(
+        base_url="https://example.com/v1",
+        api_key="sk-test",
+        model="test-model",
+    )
+    client._append_history("group:test", "旧问题", "旧回答")
+
+    messages = client._build_messages(
+        "group:test",
+        "继续说",
+        memory_context=[
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧回答"},
+        ],
+    )
+
+    assert [item.get("content") for item in messages].count("旧问题") == 1
+    assert [item.get("content") for item in messages].count("旧回答") == 1
 
 
 class _FakeResp:
@@ -15,6 +46,56 @@ class _FakeResp:
         return self._payload
 
 
+@pytest.mark.asyncio
+async def test_http_pool_reuses_real_tcp_connection_and_closes(monkeypatch):
+    import asyncio
+    from backend.core.ai_client import AIClientPool
+
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    connections = []
+    handlers = []
+    disconnected = asyncio.Event()
+
+    async def handle(reader, writer):
+        handlers.append(asyncio.current_task())
+        connections.append(writer)
+        try:
+            while True:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            disconnected.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    pool = AIClientPool()
+    first = pool.acquire(url, timeout_sec=2)
+    second = pool.acquire(url, timeout_sec=2)
+    try:
+        assert first is second
+        assert (await first.get(url)).status_code == 200
+        await pool.release(url)
+        assert not second.is_closed
+        assert (await second.get(url)).status_code == 200
+        assert len(connections) == 1
+        await pool.release(url)
+        await asyncio.wait_for(disconnected.wait(), 2)
+        assert second.is_closed and not pool._clients and not pool._ref_count
+    finally:
+        await first.aclose()
+        server.close()
+        await server.wait_closed()
+        for writer in connections:
+            writer.close()
+        for task in handlers:
+            task.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+
+
 class _FakeHttpClient:
     def __init__(self, payload: dict, observed_payloads: list):
         self._payload = payload
@@ -23,6 +104,131 @@ class _FakeHttpClient:
     async def post(self, url, headers=None, json=None, timeout=None):
         self._observed_payloads.append(json or {})
         return _FakeResp(self._payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoded", ["aW1hZ2U=", None])
+async def test_image_preprocessing_offloads_only_image_work(monkeypatch, encoded):
+    import threading
+    from backend.utils import image_processing
+
+    loop_thread = threading.get_ident()
+    calls = []
+    observed = []
+    client = AIClient(
+        base_url="https://example.com/v1", api_key="sk-test",
+        model="test-model", max_retries=0,
+    )
+
+    def process(path):
+        assert threading.get_ident() != loop_thread
+        calls.append(path)
+        return encoded
+
+    original_build = client._build_messages
+
+    def build(*args, **kwargs):
+        assert threading.get_ident() == loop_thread
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(image_processing, "process_image_for_api", process)
+    monkeypatch.setattr(client, "_build_messages", build)
+    monkeypatch.setattr(client, "_get_http_client", lambda: _FakeHttpClient(
+        {"choices": [{"message": {"content": "收到图片"}}]}, observed,
+    ))
+
+    assert await client.generate_reply("test", "看看", image_path="synthetic.png") == "收到图片"
+    assert calls == ["synthetic.png"]
+    content = observed[0]["messages"][-1]["content"]
+    if encoded:
+        assert content[1]["image_url"]["url"] == f"data:image/jpeg;base64,{encoded}"
+    else:
+        assert content == "看看"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_owner", [False, True])
+async def test_deduplicated_request_cancellation_is_settled(monkeypatch, cancel_owner):
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    client = AIClient(
+        base_url="https://example.com/v1", api_key="sk-test",
+        model="test-model", max_retries=0,
+    )
+
+    class SlowHttp:
+        async def post(self, *args, **kwargs):
+            started.set()
+            await release.wait()
+            return _FakeResp({"choices": [{"message": {"content": "reply"}}]})
+
+    monkeypatch.setattr(client, "_get_http_client", lambda: SlowHttp())
+    owner = asyncio.create_task(client.generate_reply("test", "hello"))
+    tasks = [owner]
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        waiter = asyncio.create_task(client.generate_reply("test", "hello"))
+        survivor = asyncio.create_task(client.generate_reply("test", "hello"))
+        tasks.extend([waiter, survivor])
+        await asyncio.sleep(0)
+        (owner if cancel_owner else waiter).cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await (owner if cancel_owner else waiter)
+        if cancel_owner:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(survivor), 0.2)
+        else:
+            release.set()
+            assert await asyncio.wait_for(survivor, 1) == "reply"
+            assert await owner == "reply"
+        assert not client._pending_requests
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_image, expected_calls", [("first.png", 1), ("second.png", 2)])
+async def test_image_request_deduplication_includes_image_path(monkeypatch, second_image, expected_calls):
+    import asyncio
+    from backend.utils import image_processing
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    observed = []
+    client = AIClient(
+        base_url="https://example.com/v1", api_key="sk-test",
+        model="test-model", max_retries=0,
+    )
+
+    class SlowHttp:
+        async def post(self, *args, **kwargs):
+            observed.append(kwargs["json"]["messages"][-1]["content"][1]["image_url"]["url"])
+            started.set()
+            await release.wait()
+            return _FakeResp({"choices": [{"message": {"content": f"reply {len(observed)}"}}]})
+
+    monkeypatch.setattr(image_processing, "process_image_for_api", lambda path: path)
+    monkeypatch.setattr(client, "_get_http_client", lambda: SlowHttp())
+    first = asyncio.create_task(client.generate_reply("test", "看看", image_path="first.png"))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        second = asyncio.create_task(client.generate_reply("test", "看看", image_path=second_image))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        release.set()
+        replies = await asyncio.wait_for(asyncio.gather(*tasks), 1)
+        assert len(observed) == expected_calls
+        assert replies == (["reply 1", "reply 1"] if expected_calls == 1 else ["reply 1", "reply 2"])
+        assert observed[-1] == f"data:image/jpeg;base64,{second_image}"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class _FakeProbeResp:
@@ -355,6 +561,26 @@ async def test_ai_client_codex_oauth_generate_reply_uses_responses_transport(mon
     assert ok is True
     assert mode == "responses"
     assert observed["messages"][-1]["content"] == "ping"
+
+
+def test_ai_client_codex_oauth_payload_omits_public_output_token_limit():
+    client = AIClient(
+        base_url="https://chatgpt.com/backend-api",
+        api_key="codex-access-token",
+        auth_transport="openai_codex_responses",
+        model="gpt-5.4-mini",
+        max_tokens=256,
+        max_completion_tokens=128,
+        max_retries=0,
+    )
+
+    payload = client._build_openai_codex_payload(
+        [{"role": "user", "content": "ping"}]
+    )
+
+    assert payload["model"] == "gpt-5.4-mini"
+    assert "max_output_tokens" not in payload
+    assert "temperature" not in payload
 
 
 @pytest.mark.asyncio

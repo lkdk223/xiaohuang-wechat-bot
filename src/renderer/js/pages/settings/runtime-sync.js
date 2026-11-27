@@ -126,6 +126,10 @@ function scheduleLocalAuthSyncRefresh(page) {
         if (!page.isActive() || page._isSaving) {
             return;
         }
+        if (page._hasPendingChanges) {
+            page._pendingConfigReload = true;
+            return;
+        }
         void page.loadSettings({ silent: true, preserveFeedback: true });
     }, delayMs);
 }
@@ -197,7 +201,7 @@ export function watchConfigChanges(page) {
         if (page._isSaving) {
             return;
         }
-        if (!page.isActive()) {
+        if (!page.isActive() || page._hasPendingChanges) {
             page._pendingConfigReload = true;
             return;
         }
@@ -296,6 +300,13 @@ export async function loadSettings(page, options = {}, text = {}) {
             } catch (_) {}
             if (!mergedResult?.success) {
                 throw new Error(mergedResult?.message || text.loadFailed);
+            }
+            // Background config/auth refreshes must never replace values that the
+            // user edited while the async request was in flight. A successful save
+            // is allowed to reload because it needs the persisted canonical values.
+            if (page._hasPendingChanges && !page._isSaving) {
+                page._pendingConfigReload = true;
+                return mergedResult;
             }
 
             const runtimeVersion = normalizeConfigVersion(page.getState('bot.status.config_snapshot.version'));
@@ -456,6 +467,11 @@ export function maybeRefreshForRuntimeConfigChange(page) {
 
     const runtimeVersion = Number(page.getState('bot.status.config_snapshot.version') || 0);
     if (!runtimeVersion || runtimeVersion <= page._lastConfigVersion) {
+        return;
+    }
+
+    if (page._hasPendingChanges) {
+        page._pendingConfigReload = true;
         return;
     }
 

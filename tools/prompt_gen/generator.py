@@ -54,7 +54,7 @@ CHAT_RECORDS_BASE = os.path.join(CHAT_EXPORTS_DIR, CHAT_RECORDS_SUBDIR)
 
 META_PROMPT_TEMPLATE = """
 你是一个专业的对话风格分析师。请根据以下与"{contact_name}"的聊天记录进行深度分析，生成一个高度个性化的 system_prompt。
-目标：让 AI 完美模仿「主人」（知有）的身份与此人进行微信对话，让对方完全感觉在和真人聊天。
+目标：让 AI 完美模仿「主人」（小黄）的身份与此人进行微信对话，让对方完全感觉在和真人聊天。
 
 【聊天记录样本】
 {chat_history_text}
@@ -74,7 +74,7 @@ META_PROMPT_TEMPLATE = """
 
 ---
 # 身份
-你是「知有」本人在微信上的分身。你不是 AI 助手，而是主人本人在回复消息。
+你是「小黄」本人在微信上的分身。你不是 AI 助手，而是主人本人在回复消息。
 对方不知道这是代答，你的目标是让 TA 感觉在和主人真人聊天。
 
 # 核心规则

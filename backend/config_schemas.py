@@ -75,8 +75,10 @@ class ReplyPolicyConfig(BaseModel):
     pending_ttl_hours: int = Field(default=24, ge=1, le=24 * 30)
 
 class BotConfig(BaseModel):
+    image_generation_enabled: bool = True
     # Identity
-    self_name: str = '知有'
+    self_name: str = '小黄'
+    self_name_aliases: List[str] = Field(default_factory=lambda: ['知有', 'ikun'])
     system_prompt: str = ""
     system_prompt_overrides: Dict[str, str] = Field(default_factory=dict)
     
@@ -86,8 +88,15 @@ class BotConfig(BaseModel):
     emoji_replacements: Dict[str, str] = Field(default_factory=dict)
     
     # Transport
+    transport_backend: Literal['wcferry', 'pyweixin'] = 'wcferry'
     silent_mode_required: bool = False
     required_wechat_version: str = OFFICIAL_SUPPORTED_WECHAT_VERSION
+    pyweixin_test_contact: str = ""
+    pyweixin_send_enabled: bool = False
+    pyweixin_window_mode: Literal['sidebar', 'independent'] = 'sidebar'
+    pyweixin_max_contacts: int = Field(default=8, ge=1, le=20)
+    pyweixin_whitelist_auto_reply: bool = True
+    pyweixin_reply_to_own_group_visual: bool = False
     # Voice
     voice_to_text: bool = True
     voice_to_text_fail_reply: str = ""
@@ -109,6 +118,8 @@ class BotConfig(BaseModel):
     poll_interval_min_sec: float = 0.05
     poll_interval_max_sec: float = 1.0
     poll_interval_backoff_factor: float = 1.2
+    poll_timeout_sec: float = Field(default=10.0, ge=0.0)
+    visual_duplicate_window_sec: float = Field(default=90.0, ge=0.0)
     min_reply_interval_sec: float = 0.1
     random_delay_range_sec: List[float] = Field(default_factory=lambda: [0.1, 0.3])
 
@@ -150,7 +161,6 @@ class BotConfig(BaseModel):
     config_reload_mode: Literal['auto', 'polling', 'watchdog'] = 'auto'
     config_reload_debounce_ms: int = 500
     reload_ai_client_module: bool = False
-    keepalive_idle_sec: float = 0.0
     reconnect_max_retries: int = 3
     reconnect_backoff_sec: float = 2.0
     reconnect_max_delay_sec: float = 20.0
@@ -158,6 +168,11 @@ class BotConfig(BaseModel):
     # Group control
     group_reply_only_when_at: bool = False
     group_include_sender: bool = True
+    natural_chat_mode: bool = True
+
+    # Online search (currently supported by the OpenAI/Codex Responses transport)
+    web_search_enabled: bool = True
+    web_search_always_on: bool = False
 
     # Send control
     send_exact_match: bool = True

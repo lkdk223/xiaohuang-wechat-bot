@@ -445,6 +445,56 @@ async def test_memory_manager_get_recent_context_batch_returns_grouped_rows():
 
 
 @pytest.mark.asyncio
+async def test_recent_context_batch_crosses_sql_batch_boundary(tmp_path):
+    manager = MemoryManager(str(tmp_path / "batch.db"))
+    try:
+        ids = [f"chat:{i}" for i in range(105)]
+        for chat in (ids[0], ids[100], ids[-1]):
+            await manager.add_messages(chat, [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "new"},
+            ])
+        result = await manager.get_recent_context_batch([*ids, ids[0], " "], limit=1)
+        assert list(result) == ids
+        for chat in (ids[0], ids[100], ids[-1]):
+            assert result[chat] == [{"role": "assistant", "content": "new"}]
+        assert result[ids[1]] == []
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_recent_context_batch_is_index_bounded_and_matches_single_reads(tmp_path):
+    manager = MemoryManager(str(tmp_path / "indexed.db"))
+    try:
+        db = await manager.initialize()
+        chat = "chat:' OR 1=1 --"
+        await db.executemany(
+            "INSERT INTO chat_history(wx_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            [(chat, "user", str(i), 1) for i in range(10000)]
+            + [(chat, "assistant", "", 1), ("other", "user", "other", 1)],
+        )
+        await db.commit()
+        expected = await manager.get_recent_context(chat, limit=3)
+        steps = 0
+
+        def progress():
+            nonlocal steps
+            steps += 100
+            return int(steps > 5000)
+
+        await db.set_progress_handler(progress, 100)
+        try:
+            result = await manager.get_recent_context_batch([chat, "missing", chat], limit=3)
+        finally:
+            await db.set_progress_handler(None, 0)
+        assert result == {chat: expected, "missing": []}
+        assert len(expected) == 2  # The empty newest row still counts toward LIMIT.
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_runtime_reranks_runtime_memory_results(monkeypatch):
     monkeypatch.setattr(AgentRuntime, "_load_integrations", _fake_integrations)
 
@@ -738,6 +788,41 @@ async def test_select_specific_ai_client_prefers_vector_memory_embedding_overrid
     assert client is not None
     assert preset_name == "Ollama"
     assert captured["embedding_model"] == "bge-m3:latest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("specific", [False, True])
+async def test_cancelled_probe_closes_candidate(monkeypatch, specific):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    started = asyncio.Event()
+
+    async def probe():
+        started.set()
+        await asyncio.Event().wait()
+
+    client = SimpleNamespace(probe=probe, close=AsyncMock())
+    settings = {"name": "test"}
+    monkeypatch.setattr(factory_module, "build_api_candidates", lambda cfg: [settings])
+    monkeypatch.setattr(factory_module, "_expand_provider_auth_runtime_variants", lambda *args: [settings])
+    monkeypatch.setattr(factory_module, "_prepare_runtime_settings_candidate", lambda *args: settings)
+    monkeypatch.setattr(factory_module, "_build_runtime_client_for_settings", lambda *args: client)
+    operation = (
+        factory_module._select_specific_candidate_variants({}, {}, settings, "test")
+        if specific else factory_module.select_ai_client({}, {})
+    )
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        client.close.assert_awaited_once()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1453,6 +1538,7 @@ async def test_reconnect_wechat_retries_wcferry_transport(monkeypatch):
             base_delay_sec=0.1,
             max_delay_sec=0.2,
         ),
+        bot_cfg={"transport_backend": "wcferry"},
     )
 
     assert client is not None

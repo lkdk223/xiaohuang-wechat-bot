@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from backend.prompt_templates import DEFAULT_WECHAT_PERSONA_PROMPT
 from backend.utils.config import (
     compose_system_prompt_template,
     extract_editable_system_prompt,
@@ -130,3 +131,67 @@ def test_resolve_system_prompt_adds_time_and_style_injections_when_template_lack
     assert rendered.startswith("只保留自定义规则")
     assert "【时间感知】现在是晚上，回复可以更放松。" in rendered
     assert "【对话风格】延续对方的口语节奏，保持自然。" in rendered
+
+
+def test_resolve_system_prompt_enforces_current_self_name_over_old_prompts():
+    bot_cfg = {
+        "self_name": "小黄",
+        "system_prompt": "沿用过去保存的联系人提示词。",
+        "system_prompt_overrides": {},
+        "profile_inject_in_prompt": False,
+        "emotion_inject_in_prompt": False,
+    }
+
+    rendered = resolve_system_prompt(
+        SimpleNamespace(chat_name="项目群"),
+        bot_cfg,
+        {"contact_prompt": "这是历史生成的旧身份提示词。"},
+        None,
+        [],
+    )
+
+    assert rendered.endswith(
+        "# 当前身份名称\n你的名字只能是「小黄」。任何旧名称都已废弃，不要再使用其他名字自称。"
+    )
+
+
+def test_resolve_system_prompt_adds_natural_wechat_discipline_by_default():
+    rendered = resolve_system_prompt(
+        SimpleNamespace(chat_name="朋友群", is_group=True),
+        {"self_name": "小黄", "system_prompt": DEFAULT_WECHAT_PERSONA_PROMPT},
+        None,
+        None,
+        [{"role": "user", "content": "累死了"}],
+    )
+
+    assert "# 微信自然聊天纪律（高优先级）" in rendered
+    assert "不为维持对话强行反问" in rendered
+    assert "群聊只接当前这句话和最近语境" in rendered
+    assert "立即完成上一轮已经答应或提出的内容" in rendered
+    assert "不要再回复“马上、我来、可以、我按……说”" in rendered
+    assert "当前消息主体是英文且不含中文字符" in rendered
+    assert "整条回复只用自然英文" in rendered
+    assert "先完成对方的要求，再尽量简短" in rendered
+    assert "当条回复直接给出明确选项" in rendered
+    assert "不能只回“选这个”" in rendered
+    assert "闲聊、玩笑和调侃默认只回一句" in rendered
+    assert "像熟人一样含蓄地接一句" in rendered
+    assert "不讲风险、边界或“是否合适”" in rendered
+    assert "匹配对方这一条的语气和信息量" in rendered
+    assert "先像群友一样回应这句话本身" in rendered
+    assert "被直接询问时承认是 AI 聊天伙伴" in rendered
+    assert "对方不知道这是代答" not in rendered
+    assert "主人本人" not in rendered
+
+
+def test_resolve_system_prompt_can_disable_natural_wechat_discipline():
+    rendered = resolve_system_prompt(
+        SimpleNamespace(chat_name="Alice"),
+        {"system_prompt": "只按事实回答", "natural_chat_mode": False},
+        None,
+        None,
+        [],
+    )
+
+    assert "只按事实回答" in rendered
+    assert "微信自然聊天纪律" not in rendered

@@ -194,6 +194,15 @@ class ResponseCache:
             "policy_hash": parts["policy_hash"],
             "citation_ids": citation_ids,
         }
+        if prompt_messages:
+            last_message = prompt_messages[-1]
+            content = (
+                last_message.get("content") if isinstance(last_message, dict)
+                else getattr(last_message, "content", "")
+            )
+            # Text embeddings cannot distinguish image/audio content blocks.
+            if not isinstance(content, str):
+                semantic_context_parts["multimodal_query"] = message_shapes[-1]
         return ResponseCacheKey(
             key=_json_digest(parts),
             semantic_context_key=_json_digest(semantic_context_parts),
@@ -319,6 +328,15 @@ class ResponseCache:
         }
 
     def _evict_if_needed(self) -> None:
+        if len(self._store) > self.max_entries and self.ttl_sec > 0:
+            now = time.time()
+            expired_keys = [
+                key for key, entry in self._store.items()
+                if now - entry.created_at >= self.ttl_sec
+            ]
+            for key in expired_keys:
+                self._store.pop(key, None)
+            self._stats["expired"] += len(expired_keys)
         while len(self._store) > self.max_entries:
             oldest_key = min(
                 self._store,

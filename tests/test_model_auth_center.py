@@ -259,6 +259,46 @@ def test_project_provider_auth_center_respects_selected_profile(tmp_path):
     assert openai_preset["provider_auth_profile_id"] == "openai:codex_local:chatgpt"
 
 
+def test_projected_oauth_binding_is_idempotent_when_migrated_again(tmp_path):
+    store = CredentialStore(str(tmp_path / "creds.json"))
+    config = ensure_provider_auth_center_config(_base_config(), credential_store=store)
+    entry = config["api"]["provider_auth_center"]["providers"]["openai"]
+    entry["auth_profiles"].append(
+        {
+            "id": "openai:codex_local:chatgpt",
+            "provider_id": "openai",
+            "method_id": "codex_local",
+            "method_type": "local_import",
+            "label": "ChatGPT 本机登录",
+            "credential_ref": "",
+            "credential_source": "local_config_file",
+            "binding": {
+                "source": "codex_auth_json",
+                "source_type": "openai_codex",
+                "credential_source": "local_config_file",
+                "sync_policy": "follow",
+                "follow_local_auth": True,
+                "metadata": {"watch_paths": ["auth.json"]},
+            },
+            "metadata": {"runtime_ready": True},
+        }
+    )
+    entry["selected_profile_id"] = "openai:codex_local:chatgpt"
+    entry.setdefault("metadata", {})["selection_mode"] = "manual"
+
+    projected = project_provider_auth_center(config["api"])
+    config["api"] = projected
+    normalized = ensure_provider_auth_center_config(config, credential_store=store)
+    profile = next(
+        item
+        for item in normalized["api"]["provider_auth_center"]["providers"]["openai"]["auth_profiles"]
+        if item["id"] == "openai:codex_local:chatgpt"
+    )
+
+    assert profile["binding"]["metadata"] == {"watch_paths": ["auth.json"]}
+    assert "metadata" not in profile["binding"]["metadata"]
+
+
 def test_select_runtime_profile_prefers_oauth_over_api_key_in_auto_mode(tmp_path):
     store = CredentialStore(str(tmp_path / "creds.json"))
     config = ensure_provider_auth_center_config(_base_config(), credential_store=store)

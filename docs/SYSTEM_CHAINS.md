@@ -1,5 +1,32 @@
 # 系统链路说明
 
+## 自然聊天提示链
+
+`backend/prompt_templates.py` 分离默认人物设定与高优先级微信表达纪律。
+`resolve_system_prompt()` 先选择会话覆盖或联系人提示，再规范化固定历史/画像/情境占位，
+最后在 `bot.natural_chat_mode=true` 时追加自然聊天纪律。这样所有 OpenAI-compatible、
+Anthropic 与 Codex Responses 传输使用同一套规则，不在某个 provider 分支重复注入。
+该字段属于运行时 AI 重载集合，修改共享配置后会重建客户端。历史消息仍作为上下文事实，
+但其中的指令不能覆盖固定纪律。最终发送层继续负责 AI 前缀清理、重复段落去重与自然分段。
+语言选择以当前消息为准：纯英文主体触发全英文回复，中文或中英混合输入保持中文回复。
+发送前 `refine_reply_text()` 会在不少于 40 字时检测整段连续重复，允许边界处只有空白差异；
+短语气词重复不折叠。消息合并采用短静默窗口并受总等待上限约束。
+合并等待时长使用单调时钟计算，系统校时前跳或回拨不会改变合并预算；日志仍使用实际日期时间。
+图片/表情包输入在 `extract_visual_chat_reply()` 提取可发文本后，还会只移除回复末尾的 Unicode emoji，不改动普通文字回复的 emoji 策略。
+
+## 显式图片生成链路
+
+`handle_event` 完成既有消息过滤后，先调用 `bot_image_flow.handle_drawing_command`。
+非画图指令继续原文字流程；明确画图指令经暂停/静默/白名单/回复策略校验后，
+由 `core/image_generation.py` 使用独立环境凭据调用 Images API。
+每个进程单任务、60 秒冷却、无付费重试；不经过文字缓存或把 base64 拼进文字回复。
+保存 PNG 后取得原有 `wx_lock`，再次校验当前策略并获取当前 transport，调用
+`BaseTransport.send_image`。默认 transport 拒绝；wcferry 使用原生 send_image，
+pyweixin 仅向白名单独立窗口粘贴校验后的位图并检查新发图片气泡。
+任意文件发送的旧限制不改变。失败/策略变化保留本机图片，不热重发，不回退当前聊天窗口。
+新增配置沿用共享配置校验与设置页字段映射/IPC 保存，不新增旁路配置源。
+此能力尚未接入图片人工审批或文字回复统计；验证/排障使用 `IMAGE.*` 日志和实际图片。
+
 本文档用于集中说明当前系统中的主要链路、每条链路的节点职责，以及这些节点在代码中是如何实现的。
 
 适用范围：
@@ -12,6 +39,11 @@
 - 记忆、RAG、观测与配置热更新
 
 ## 1. 分层总览
+
+内存回答缓存容量超限时，先回收超过 TTL 的条目，再按最近访问时间淘汰有效条目。
+Embedding 内存缓存独立限制为 256 条：写满后先回收过期项，再按写入顺序淘汰；TTL 从生成完成起按单调时钟计算，TTL 为 0 也仍受容量限制。缓存未命中时正常重新生成，不影响已持久化的聊天或向量数据。
+直连聊天、SSE、Embedding 和探测 HTTP 客户端按运行时实例及超时值复用，认证头仍按请求构造。客户端由运行时 close 统一关闭，关闭后禁止重新取得会话；不跨运行时共享 Cookie 状态。单独构造且未绑定运行时的 Embedding 适配器仍按请求自行关闭客户端。
+读取仍执行 TTL 校验；过期回收计入 expired，容量淘汰计入 evictions。
 
 系统可以分成 6 层：
 
@@ -172,8 +204,8 @@
 4. `backend/core/factory.py::reconnect_wechat`
    - 功能：连接或重连微信传输层。
    - 实现：
-     - 仅支持 `wcferry`。
-     - 按重试策略构造 `WcferryTransport`。
+     - 支持 `wcferry` 与 `pyweixin`。
+     - 按重试策略构造所选传输实现。
      - 记录最近一次传输层错误，供状态接口和诊断面板使用。
 
 5. `backend/bot_manager.py::_run_bot`
@@ -184,6 +216,12 @@
      - 在退出时清理状态并广播。
 
 ## 5. 传输层链路
+
+传输后端由共享配置 `bot.transport_backend` 选择：
+
+- `wcferry`：微信 `3.9.12.51` 的静默注入后端。
+- `pyweixin`：微信 `4.1.6+` 的可见 UI Automation 后端；默认 `pyweixin_window_mode=sidebar`，只绑定一个微信主窗口。轮询左侧会话列表中精确白名单项的未读标记和最新消息预览变化（后者覆盖消息免打扰会话），选中目标后再绑定右侧消息列表与输入框。读取和发送前均要求顶部当前会话名与目标完全一致，所有会话切换和读写由同一锁串行化；校验失败时禁止读写，防止串群。启动时依次选中白名单会话（默认最多 8 个）并忽略当时可见历史；后续同时比较 UIA runtime ID 和可见消息序列，只把新出现且能可靠判断方向的文本、图片和表情包送入统一转换链。表情包通过 UIA 媒体控件截取当前帧，不读取聊天数据库；发送仍遵守白名单、草稿模式和回复策略。`independent` 保留原来每会话独立窗口的回滚链路。
+- 本人发送的消息默认继续用于防循环过滤；仅当 `pyweixin_reply_to_own_group_visual=true` 时，白名单群里的本人图片/收藏表情会作为输入。图片生成发送后还有短时 echo 窗口防重，但不能代替该默认关闭策略。
 
 链路目标：把微信收发能力适配成机器人可消费的统一接口。
 
@@ -240,6 +278,7 @@
    - 功能：主轮询循环。
    - 实现：
      - 按轮询间隔拉取微信新消息。
+     - 单次轮询受 `bot.poll_timeout_sec` 保护；界面自动化调用超时后按既有重连策略重建监听会话，避免状态仍显示运行但实际不再收消息。
      - 调用 `normalize_new_messages()` 标准化。
      - 为每条消息创建处理任务，受并发信号量控制。
 
@@ -324,25 +363,29 @@
      - 成功时把 `event.content` 替换为转写结果。
      - 失败时按 `voice_to_text_fail_reply` 可选回复失败提示。
 
-## 9. 图片消息链
+## 9. 图片与表情包消息链
 
-链路目标：把图片消息包装为可被 AI 模型识别的多模态输入。
+链路目标：把图片或表情包消息包装为可被 AI 模型识别的多模态输入，并让模型理解表情包的画面文字、情绪和交流意图后自然回应。
 
 ### 节点
 
-1. `backend/transports/wcferry_adapter.py::save_media`
-   - 功能：下载图片到目标路径。
-   - 实现：调用 `download_image` 并移动到目标文件。
+1. 传输层媒体保存
+   - `backend/transports/wcferry_adapter.py::save_media` 下载图片或表情附件到目标路径。
+   - `backend/transports/pyweixin_adapter.py::PyWeixinVisualMessage.save_file` 截取白名单会话中图片/表情气泡的当前可见帧。
 
 2. `backend/utils/image_processing.py::process_image_for_api`
    - 功能：把图片转为 base64 数据 URL 所需内容。
    - 实现：读取图片并生成适合模型接口的编码。
 
-3. `backend/core/agent_runtime.py::_build_prompt_messages`
+3. `backend/core/agent_runtime_prepare.py::build_prompt_messages`
    - 功能：构造多模态 message。
    - 实现：
      - 文本部分放在 `type=text`。
      - 图片部分放在 `type=image_url`。
+     - 表情包文本部分要求模型识别画面文字、情绪与交流意图，并按聊天语境自然回应。
+
+4. `backend/bot_reply_flow.py`
+   - 功能：回复完成后删除本次保存的临时图片或表情帧。
 
 ## 10. AI 运行时链
 
@@ -376,8 +419,10 @@
     - 功能：非流式模型调用。
     - 实现：
       - 调用 `ChatOpenAI.ainvoke()`。
+      - OpenAI / Codex Responses 传输仅在明确搜索请求、新闻、天气、价格等当前信息需要联网时暴露并强制使用网页搜索工具；没有显式配置推理强度时，联网请求自动使用低推理与低冗长度以缩短等待。`web_search_always_on=true` 时每条消息都要求搜索。
       - 响应统一经过兼容层标准化，收敛正文、推理、工具调用与 finish reason。
       - `response_cache` 先查精确 key；若 `semantic_enabled=true` 且精确未命中，才对当前用户文本生成 embedding，并在同上下文边界内计算语义相似命中；命中后仍重新执行安全护栏。
+      - 当前用户消息含图片等非字符串内容时，完整消息的安全摘要也进入语义上下文边界，避免同附文不同图片误用旧答案；不会仅凭文字 embedding 跨图片匹配。精确命中仍要求完整请求一致，缓存键仅保留摘要。验证命令：`python -m pytest tests/test_response_cache.py tests/test_agent_runtime.py -q`。
       - `agent.model_tool_calls_enabled` 默认关闭；开启后仅在 OpenAI-compatible 对话接口中向模型暴露 `readiness_check`、`eval_latest`、`cost_summary`、`backup_cleanup_dry_run`、`data_controls_dry_run` 五个安全工具。
       - 模型侧工具调用复用 `ControlledToolWorkflowService` 的注册工具、payload schema、permission、timeout 和 trace，不新增执行器，也不向模型暴露 `prompt_preview` 或 `config_audit`。
       - 运行时最多执行一轮模型工具调用，再请求一轮 final 回复；如果 final 继续返回 `tool_calls`，只记录 `model_tool_call_loop_blocked`，不会进入循环。
@@ -515,7 +560,7 @@
    - 功能：运行时热应用配置。
    - 实现：
      - 更新当前 bot/config/agent 配置。
-     - 必要时重载 AI 客户端。
+     - 必要时重载 AI 客户端；开启 `reload_ai_client_module` 时同时重载 `AIClient` 与 `AgentRuntime`，避免运行时仍使用旧回复逻辑。
      - 必要时重连微信传输层。
      - 广播状态变化。
 

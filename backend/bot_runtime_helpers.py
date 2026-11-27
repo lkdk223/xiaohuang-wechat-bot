@@ -140,6 +140,25 @@ def build_reply_body_text(bot_cfg: Dict[str, Any], reply_text: str) -> str:
     return str(fallback_sanitized or "").strip()
 
 
+def enforce_current_self_name(bot_cfg: Dict[str, Any], text: str) -> str:
+    """Replace configured legacy self names immediately before sending."""
+    current_name = str(bot_cfg.get("self_name") or "").strip()
+    if not current_name or not text:
+        return text
+    aliases = bot_cfg.get("self_name_aliases") or []
+    if not isinstance(aliases, (list, tuple, set)):
+        aliases = []
+    result = str(text)
+    for alias in sorted(
+        {str(value or "").strip() for value in aliases},
+        key=len,
+        reverse=True,
+    ):
+        if alias and alias != current_name:
+            result = result.replace(alias, current_name)
+    return result
+
+
 def ensure_send_succeeded(result: Any, *, context: str) -> None:
     ok, err_msg = result
     if ok:
@@ -162,7 +181,8 @@ def build_final_reply_text(bot_cfg: Dict[str, Any], ai_client: Any, reply_text: 
     if not sanitized:
         return ""
     suffix = build_reply_suffix_text(bot_cfg, ai_client)
-    return f"{sanitized}{suffix}" if suffix else sanitized
+    final_text = f"{sanitized}{suffix}" if suffix else sanitized
+    return enforce_current_self_name(bot_cfg, final_text)
 
 
 def get_natural_split_config(bot_cfg: Dict[str, Any]) -> Dict[str, float]:
@@ -193,6 +213,7 @@ __all__ = [
     "build_reply_body_text",
     "build_reply_suffix_text",
     "ensure_send_succeeded",
+    "enforce_current_self_name",
     "get_natural_split_config",
     "is_filehelper_chat",
     "is_recent_outgoing_echo",

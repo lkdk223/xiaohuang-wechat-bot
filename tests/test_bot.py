@@ -72,6 +72,57 @@ def _build_pending_reply_memory():
 def test_bot_schema_allows_zero_reply_deadline():
     assert BotConfig(reply_deadline_sec=0).reply_deadline_sec == 0
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wall_clock", [[1000, 900], [1000, 2000]])
+async def test_merge_max_wait_ignores_wall_clock_changes(wall_clock):
+    bot = WeChatBot("config.yaml")
+    bot.bot_cfg = {"merge_user_messages_sec": 1, "merge_user_messages_max_wait_sec": 1.2}
+    bot._ensure_event_defaults = MagicMock()
+    bot._prepare_event_for_processing = MagicMock(return_value="normal")
+    bot._build_event_trace_id = MagicMock(return_value="test")
+    bot._log_flow = MagicMock()
+    bot._notify_runtime_status_changed = MagicMock()
+    bot.wait_and_reply = AsyncMock()
+    event = SimpleNamespace(msg_type="text", content="hello")
+    try:
+        with patch("backend.bot.should_reply_with_reason", return_value=(True, "ok")), \
+             patch("backend.bot.build_reply_policy_chat_id", return_value="test"), \
+             patch("backend.bot.time.time", side_effect=wall_clock), \
+             patch("backend.bot.time.monotonic", side_effect=[100, 101]):
+            await bot.schedule_merged_reply(None, event)
+            await bot.schedule_merged_reply(None, event)
+        assert bot.wait_and_reply.call_args.args[2] == pytest.approx(0.2)
+    finally:
+        for task in list(bot.pending_tasks):
+            task.cancel()
+        await asyncio.gather(*list(bot.pending_tasks), return_exceptions=True)
+
+
+def test_bot_schema_allows_zero_poll_timeout():
+    assert BotConfig(poll_timeout_sec=0).poll_timeout_sec == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_transport_messages_times_out_stuck_poll():
+    bot = WeChatBot("config.yaml")
+    bot.bot_cfg = {"poll_timeout_sec": 0.01}
+    wx = MagicMock()
+
+    async def stuck_to_thread(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    with patch("asyncio.to_thread", side_effect=stuck_to_thread):
+        with pytest.raises(TimeoutError, match="监听窗口可能已失效"):
+            await bot._poll_transport_messages(wx, filter_mute=False)
+
+
+def test_bot_schema_preserves_web_search_settings():
+    config = BotConfig(web_search_enabled=True, web_search_always_on=True)
+
+    assert config.web_search_enabled is True
+    assert config.web_search_always_on is True
+
 @pytest.mark.asyncio
 async def test_bot_initialization(mock_config):
     mock_service = _build_config_service(mock_config)
@@ -258,7 +309,101 @@ async def test_bot_run_exits_when_initialize_returns_none():
         await bot.run()
 
         bot.initialize.assert_awaited_once()
-        bot.shutdown.assert_awaited_once()
+    bot.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wall_now, elapsed, reconnects", [(2000, 1, 0), (500, 21, 1)])
+async def test_keepalive_uses_elapsed_time_not_wall_clock(wall_now, elapsed, reconnects):
+    from types import SimpleNamespace
+
+    with patch("backend.bot.get_bot_manager", return_value=_build_mock_bot_manager()):
+        bot = WeChatBot("config.yaml")
+    transport = MagicMock()
+    bot.bot_cfg = {"keepalive_idle_sec": 20, "config_reload_sec": 0}
+    bot.initialize = AsyncMock(return_value=transport)
+    bot.shutdown = AsyncMock()
+    bot._should_stop = MagicMock(side_effect=[False, True])
+    bot._get_active_transport = AsyncMock(return_value=transport)
+    bot._poll_transport_messages = AsyncMock(return_value={})
+    bot.ipc = MagicMock()
+    bot.ipc.get_commands.return_value = []
+    bot.config_reload_watcher = None
+    clock = SimpleNamespace(
+        time=MagicMock(side_effect=[1000, wall_now, wall_now, wall_now]),
+        monotonic=MagicMock(side_effect=[100, 100 + elapsed, 100 + elapsed, 100 + elapsed]),
+    )
+    with patch("backend.bot.time", clock), \
+         patch("backend.bot.reconnect_wechat", new_callable=AsyncMock, return_value=transport) as reconnect, \
+         patch("backend.bot.normalize_new_messages", return_value=[]), \
+         patch("backend.bot.asyncio.sleep", new_callable=AsyncMock):
+        await bot.run()
+    assert reconnect.await_count == reconnects
+    bot._poll_transport_messages.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failures", [1, 6])
+async def test_successful_poll_reconnect_resets_keepalive_clock(failures):
+    from types import SimpleNamespace
+
+    with patch("backend.bot.get_bot_manager", return_value=_build_mock_bot_manager()):
+        bot = WeChatBot("config.yaml")
+    transport = MagicMock()
+    clock = SimpleNamespace(time=lambda: 1000, monotonic=MagicMock(return_value=100))
+    bot.bot_cfg = {
+        "keepalive_idle_sec": 20, "config_reload_sec": 0,
+        "poll_interval_max_sec": 0.1,
+    }
+    bot.initialize = AsyncMock(return_value=transport)
+    bot.shutdown = AsyncMock()
+    bot._should_stop = MagicMock(side_effect=[False] * (failures + 1) + [True])
+    bot._get_active_transport = AsyncMock(return_value=transport)
+    bot._poll_transport_messages = AsyncMock(side_effect=[RuntimeError("poll failed")] * failures + [{}])
+    bot.ipc = MagicMock()
+    bot.ipc.get_commands.return_value = []
+    bot.config_reload_watcher = None
+
+    async def reconnect(*args, **kwargs):
+        # Recovery itself took longer than the keepalive interval.
+        clock.monotonic.return_value = 125
+        return transport
+
+    with patch("backend.bot.time", clock), \
+         patch("backend.bot.reconnect_wechat", new_callable=AsyncMock, side_effect=reconnect) as recover, \
+         patch("backend.bot.normalize_new_messages", return_value=[]), \
+         patch("backend.bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        await bot.run()
+    assert recover.await_count == failures
+    expected = [0.06, 0.072] if failures == 1 else [0.06, 0.072, 0.0864, 0.1, 0.1, 0.1, 0.1]
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(expected)
+    assert bot._poll_transport_messages.await_count == failures + 1
+    bot.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_active_transport_prefers_runtime_reconnect():
+    mock_bot_manager = _build_mock_bot_manager()
+    with patch("backend.bot.get_bot_manager", return_value=mock_bot_manager):
+        bot = WeChatBot("config.yaml")
+
+    stale_transport = MagicMock(name="stale_transport")
+    reconnected_transport = MagicMock(name="reconnected_transport")
+    bot.wx = reconnected_transport
+
+    assert await bot._get_active_transport(stale_transport) is reconnected_transport
+
+
+@pytest.mark.asyncio
+async def test_get_active_transport_uses_fallback_before_initialization():
+    mock_bot_manager = _build_mock_bot_manager()
+    with patch("backend.bot.get_bot_manager", return_value=mock_bot_manager):
+        bot = WeChatBot("config.yaml")
+
+    fallback = MagicMock(name="fallback_transport")
+    bot.wx = None
+
+    assert await bot._get_active_transport(fallback) is fallback
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ export class MessagesPage extends PageController {
         this._searchKeyword = '';
         this._selectedChatId = '';
         this._searchTimer = null;
+        this._refreshTimer = null;
         this._refreshing = false;
         this._pendingRefresh = false;
         this._loadingMore = false;
@@ -40,17 +41,24 @@ export class MessagesPage extends PageController {
 
     async onEnter() {
         await super.onEnter();
-        if (!this.getState('bot.connected') || this._messages.length === 0) {
-            await refreshMessages(this);
-            return;
-        }
-        renderMessagesPage(this, {
-            onOpenDetail: this._openMessageDetail,
-        });
+        await refreshMessages(this);
+        clearInterval(this._refreshTimer);
+        this._refreshTimer = setInterval(() => {
+            if (this.isActive() && this.getState('bot.connected')) {
+                void refreshMessages(this);
+            }
+        }, 3000);
+    }
+
+    async onLeave() {
+        clearInterval(this._refreshTimer);
+        this._refreshTimer = null;
+        await super.onLeave();
     }
 
     async onDestroy() {
         clearTimeout(this._searchTimer);
+        clearInterval(this._refreshTimer);
         await super.onDestroy();
     }
 }

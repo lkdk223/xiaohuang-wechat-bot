@@ -52,7 +52,7 @@ echo     Node dependencies are ready.
 echo [4/6] Building Python backend...
 if not exist "backend-dist" mkdir backend-dist
 
-"!PYTHON_EXE!" -m PyInstaller --name wechat-bot-backend --distpath "%PROJECT_ROOT%backend-dist" --workpath "%PROJECT_ROOT%build" --specpath "%PROJECT_ROOT%build" --noconfirm --clean --console --hidden-import wcferry --hidden-import quart --hidden-import hypercorn --hidden-import openai --hidden-import httpx "%PROJECT_ROOT%run.py"
+"!PYTHON_EXE!" -m PyInstaller --name wechat-bot-backend --distpath "%PROJECT_ROOT%backend-dist" --workpath "%PROJECT_ROOT%build" --specpath "%PROJECT_ROOT%build" --noconfirm --clean --console --add-data "%PROJECT_ROOT%shared;shared" --add-data "%PROJECT_ROOT%package.json;." --hidden-import wcferry --hidden-import backend.transports.pyweixin_adapter --collect-all pyweixin --hidden-import quart --hidden-import hypercorn --hidden-import openai --hidden-import httpx "%PROJECT_ROOT%run.py"
 if errorlevel 1 (
     echo PyInstaller build failed.
     exit /b 1
@@ -80,7 +80,7 @@ if exist "%PROJECT_ROOT%release\app-update.yml" del /f /q "%PROJECT_ROOT%release
 del /f /q "%PROJECT_ROOT%release\*.msi" >nul 2>&1
 
 echo     Generating SHA256SUMS.txt...
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$releaseDir = '%PROJECT_ROOT%release'; $files = Get-ChildItem -LiteralPath $releaseDir -Filter '*.exe' | Sort-Object Name; if (-not $files) { throw 'No release executables found.' }; $lines = foreach ($file in $files) { '{0}  {1}' -f (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLower(), $file.Name }; Set-Content -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt') -Value $lines -Encoding utf8"
+"!PYTHON_EXE!" "%PROJECT_ROOT%scripts\generate_sha256s.py" "%PROJECT_ROOT%release"
 if errorlevel 1 (
     echo SHA256SUMS generation failed.
     exit /b 1

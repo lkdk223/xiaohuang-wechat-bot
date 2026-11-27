@@ -10,6 +10,11 @@ class BaseTransport(ABC):
     """Minimal transport contract consumed by the bot runtime."""
 
     backend_name = "transport"
+    supports_generated_images = False
+
+    def send_image(self, filepath: str, who: Optional[str] = None, exact: bool = True) -> Dict[str, Any]:
+        """Send a validated generated image, without an arbitrary-file fallback."""
+        return {"success": False, "message": "当前后端不支持生成图片发送"}
 
     @abstractmethod
     def close(self) -> None:

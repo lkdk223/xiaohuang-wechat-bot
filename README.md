@@ -1,5 +1,20 @@
 # WeChat Chat Bot
 
+## 自然聊天模式
+
+默认启用 `bot.natural_chat_mode`：根据消息分量调整回复长度，减少复述、强行反问、
+模板安慰、无条件附和和客服式结尾，并为群聊限制主持式发言。该模式提升口语自然度，
+但不会冒充具体真人或编造现实经历；被直接询问身份时会如实说明。
+
+## image2 画图指令
+
+白名单会话中发送 `/画图 一只戴墨镜的小狗` 或 `/image2 a cat`，机器人可通过
+豆包 Seedream（优先）或 GPT Image 2 生成一张 PNG 并发送。设置页“图片生成”开关对应共享配置
+`bot.image_generation_enabled`（默认 true）；普通聊天不会触发画图。
+给启动进程配置 `ARK_API_KEY` 或 `OPENAI_API_KEY`；两者都有时优先豆包。网页登录不作为图片凭据。
+接口单独计费，不能仅凭开关判断已可用。配置、测试、失败留图位置见
+[使用手册：image2](docs/USER_GUIDE.md#image2-图片生成)。
+
 > **如果你觉得这个项目对你有帮助，请帮我点个 Star 吧！**
 >
 > 你的支持是我继续维护下去的动力 🙏
@@ -75,7 +90,7 @@ node scripts/run-interview-demo.mjs --skip-eval --json
 - `Memory`: SQLite 持久化短期记忆、用户画像、上下文事实和情绪历史。
 - `Contact Prompt Growth`: 每个联系人都可逐步沉淀一份专属 Prompt，支持后台生成、导出聊天增强和 UI 直接编辑。
 - `RAG`: 支持运行期对话向量记忆、导出聊天记录风格召回、可选 Hybrid Search + Query Rewrite，以及可选本地 `Cross-Encoder` 精排；未配置本地模型或缺依赖时自动回退轻量重排。
-- `Transport Abstraction`: 传输层统一抽象为 `BaseTransport`，默认走 `wcferry`，并保证“接收消息 → 发送消息 → 完成落盘”的主闭环可独立演进。
+- `Transport Abstraction`: 传输层统一抽象为 `BaseTransport`；默认走 `wcferry`，也可选用微信 4.1+ 的 `pyweixin` 可见界面自动化后端。
 - `Provider Compatibility`: 后端统一标准化请求字段、响应正文、工具调用、错误结构与落盘元数据，避免为单一提供方写定向分支。
 - `Desktop + Web`: Electron 桌面客户端与 Quart Web API 并存。
 - `Semantic Cache`: 响应缓存可选开启同上下文语义相似命中，默认关闭；精确命中优先，语义命中不跨 chat、provider、model、安全策略或 citation 边界。
@@ -90,6 +105,7 @@ node scripts/run-interview-demo.mjs --skip-eval --json
 flowchart TD
     A[WeChat PC 3.9.12.51] --> B[BaseTransport]
     B --> B1[WCFerry Hook Backend]
+    B --> B2[pyweixin UI Automation Backend]
     B --> C[WeChatBot]
     B1 --> C[WeChatBot]
 
@@ -135,9 +151,20 @@ flowchart TD
 - `watchdog` 已纳入默认依赖，用于配置热重载事件监听。
 - 如需启用本地 `Cross-Encoder` 精排，需要额外安装 `sentence-transformers`，并在配置中提供本地模型目录；项目不会自动联网下载模型。
 
-限制：
+微信 4.x 可见界面自动化（实验性）：
 
-- 不支持微信 `4.x`
+- 设置 `bot.transport_backend = "pyweixin"`，并安装固定依赖 `pywechat127==1.9.8`。
+- 要求微信 `4.1.6+`、Windows 桌面保持解锁、微信已登录；无需管理员权限，也不会注入或修改微信文件。
+- 安全模式要求启用联系人白名单；支持同时监听最多 8 个精确名称匹配的私聊或群聊，`bot.pyweixin_test_contact` 仅作为兼容性的首选监听顺序提示。
+- `bot.pyweixin_window_mode = "sidebar"` 是默认方式：不创建独立聊天窗口，根据未读标记或最新消息预览变化选中左侧精确白名单会话，校验右侧会话名后再读取和发送。如需回滚可设为 `"independent"`。
+- `bot.pyweixin_send_enabled = false` 时只生成待审核草稿；确认收发识别无误后才可改为 `true`。
+- `bot.self_name_aliases` 可声明废弃的机器人旧名；发送前会将这些旧名统一替换为当前 `bot.self_name`。
+- `bot.web_search_enabled = true` 时，OpenAI / Codex 本机认证回复链可按需调用网页搜索；明确要求搜索或询问新闻、天气、价格等当前信息时会强制搜索。`bot.web_search_always_on` 默认关闭，避免每条消息都增加延迟和额度消耗。
+- 当前该后端处理白名单私聊或群聊的文本、图片和表情包；图片/表情包只截取白名单聊天气泡的可见画面并交给多模态模型理解，临时帧在回复结束后删除。微信未公开群成员昵称时以“群成员”作为内部发送者标签继续回复；文件、语音、视频、红包、转账和支付消息仍不自动处理。
+
+默认 WCFerry 限制：
+
+- `wcferry` 后端不支持微信 `4.x`
 - 不支持 Linux / macOS 直接运行微信自动化
 - 运行期间需要保持微信客户端已登录且可被自动化访问
 

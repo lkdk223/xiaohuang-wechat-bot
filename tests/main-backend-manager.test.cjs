@@ -26,7 +26,7 @@ function createBackendManagerHarness(options = {}) {
         pythonProcess: proc,
     };
     const manager = createBackendManager({
-        http: {},
+        http: options.http || {},
         spawn: () => proc,
         execFile: (file, args, callback) => {
             execFileCalls.push({ file, args });
@@ -67,6 +67,43 @@ function createBackendManagerHarness(options = {}) {
 
     return { manager, GLOBAL_STATE, proc, timers, execFileCalls, backendIssues };
 }
+
+test('BackendManager.requestJson rejects interrupted response bodies', async () => {
+    const response = new EventEmitter();
+    const request = new EventEmitter();
+    request.end = () => {};
+    const { manager } = createBackendManagerHarness({ http: {
+        request: (_options, callback) => {
+            callback(response);
+            return request;
+        },
+    } });
+    const pending = manager.requestJson('GET', '/api/status');
+    const rejected = assert.rejects(pending, (error) =>
+        error.code === 'ECONNRESET' && error.endpoint === '/api/status');
+    const error = Object.assign(new Error('response interrupted'), { code: 'ECONNRESET' });
+    assert.doesNotThrow(() => response.emit('error', error));
+    await rejected;
+});
+
+test('BackendManager.requestJson handles a real truncated HTTP response', async () => {
+    const http = require('node:http');
+    const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '100' });
+        res.write('{"partial":');
+        setImmediate(() => res.destroy());
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { manager, GLOBAL_STATE } = createBackendManagerHarness({ http });
+    GLOBAL_STATE.flaskPort = server.address().port;
+    try {
+        await assert.rejects(manager.requestJson('GET', '/api/status', null, 1000),
+            (error) => error.code === 'ECONNRESET' && error.endpoint === '/api/status');
+    } finally {
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
 
 test('BackendManager.stop uses taskkill tree cleanup on Windows after graceful timeout', async () => {
     const { manager, GLOBAL_STATE, proc, timers, execFileCalls } = createBackendManagerHarness();

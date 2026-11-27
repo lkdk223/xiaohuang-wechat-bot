@@ -2,11 +2,45 @@ from backend.core.provider_compat import (
     build_anthropic_vertex_request_url,
     build_anthropic_vertex_messages_payload,
     build_openai_chat_payload,
+    build_openai_responses_payload,
     infer_auth_transport,
     normalize_anthropic_vertex_model,
     normalize_chat_result,
     normalize_provider_error,
 )
+
+
+def test_openai_responses_payload_uses_output_text_for_assistant_history():
+    payload = build_openai_responses_payload(
+        model="gpt-test",
+        messages=[
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "again"},
+        ],
+    )
+
+    assert payload["input"][0]["content"] == [
+        {"type": "input_text", "text": "hello"}
+    ]
+    assert payload["input"][1]["content"] == [
+        {"type": "output_text", "text": "hi"}
+    ]
+    assert payload["input"][2]["content"] == [
+        {"type": "input_text", "text": "again"}
+    ]
+
+
+def test_openai_responses_payload_can_enable_web_search():
+    payload = build_openai_responses_payload(
+        model="gpt-5.4-mini",
+        messages=[{"role": "user", "content": "今天有什么新闻"}],
+        tools=[{"type": "web_search"}],
+        tool_choice="auto",
+    )
+
+    assert payload["tools"] == [{"type": "web_search"}]
+    assert payload["tool_choice"] == "auto"
 
 
 class _FakeResponse:

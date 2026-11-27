@@ -9,7 +9,7 @@ from .core.reply_policy import build_chat_id
 from .core.bot_control import is_command_message, parse_control_command
 from .handlers.sender import send_message
 from .types import MessageEvent
-from .utils.message import is_image_message
+from .utils.message import is_visual_message
 from .utils.runtime_artifacts import runtime_path
 
 
@@ -20,13 +20,13 @@ async def maybe_save_event_image(
     trace_id: Optional[str] = None,
     log_flow: Optional[Any] = None,
 ) -> Optional[str]:
-    if not (is_image_message(event.msg_type) and "[图片]" in str(event.content or "")):
+    if not is_visual_message(event.msg_type):
         return None
     if not getattr(event, "raw_item", None):
         return None
 
     try:
-        filename = f"{int(time.time())}_{hash(getattr(event, 'sender', ''))}.jpg"
+        filename = f"{int(time.time_ns())}_{abs(hash(getattr(event, 'sender', '')))}.jpg"
         save_path = save_root or runtime_path("event-images", filename)
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         await asyncio.to_thread(event.raw_item.save_file, save_path)

@@ -73,6 +73,96 @@ function isLatestMessagesRequest(page, seq) {
     return Number(page._latestMessagesRequestSeq || 0) === Number(seq || 0);
 }
 
+function getPendingMetadata(pendingReply = {}) {
+    return pendingReply?.metadata && typeof pendingReply.metadata === 'object'
+        ? pendingReply.metadata
+        : {};
+}
+
+export function pendingReplyToMessage(pendingReply = {}) {
+    const metadata = getPendingMetadata(pendingReply);
+    const chatId = String(pendingReply.chat_id || metadata.chat_id || '').trim();
+    const displayName = String(
+        metadata.chat_name || metadata.sender || chatId || MESSAGE_TEXT.unnamedChat
+    ).trim();
+    const sender = String(metadata.sender || displayName || MESSAGE_TEXT.user).trim();
+    return {
+        id: `pending-source-${String(pendingReply.id || '')}`,
+        message_id: `pending-source-${String(pendingReply.id || '')}`,
+        wx_id: chatId,
+        chat_id: chatId,
+        sender: sender || MESSAGE_TEXT.user,
+        sender_display_name: sender || MESSAGE_TEXT.user,
+        display_name: displayName || MESSAGE_TEXT.unnamedChat,
+        chat_display_name: displayName || MESSAGE_TEXT.unnamedChat,
+        content: String(metadata.user_text || '').trim() || '待审批回复对应的用户消息',
+        text: String(metadata.user_text || '').trim() || '待审批回复对应的用户消息',
+        timestamp: metadata.timestamp || pendingReply.created_at || Date.now() / 1000,
+        is_self: false,
+        role: 'user',
+        msg_type: metadata.msg_type || 'text',
+        metadata: {
+            pending_reply_id: pendingReply.id,
+            pending_reply_status: pendingReply.status || 'pending',
+        },
+    };
+}
+
+function isSameSourceMessage(message, pendingMessage) {
+    if (String(message?.wx_id || message?.chat_id || '').trim()
+        !== String(pendingMessage?.wx_id || pendingMessage?.chat_id || '').trim()) {
+        return false;
+    }
+    if (String(message?.content || message?.text || '').trim()
+        !== String(pendingMessage?.content || pendingMessage?.text || '').trim()) {
+        return false;
+    }
+    const left = Number(message?.timestamp || 0);
+    const right = Number(pendingMessage?.timestamp || 0);
+    return !left || !right || Math.abs(left - right) <= 5;
+}
+
+async function loadPendingSourceMessages(currentApi, page, regularMessages) {
+    if (typeof currentApi?.listPendingReplies !== 'function') {
+        return [];
+    }
+    try {
+        const result = await currentApi.listPendingReplies({ status: 'pending', limit: 200 });
+        if (result?.success === false) {
+            return [];
+        }
+        return (Array.isArray(result?.items) ? result.items : [])
+            .map((item) => pendingReplyToMessage(item))
+            .filter((message) => message.wx_id)
+            .filter((message) => matchesMessageFilter(message, {
+                selectedChatId: page._selectedChatId,
+                searchKeyword: page._searchKeyword,
+            }))
+            .filter((message) => !regularMessages.some((item) => isSameSourceMessage(item, message)));
+    } catch (error) {
+        console.debug('[MessagesPage] pending reply sources unavailable:', error);
+        return [];
+    }
+}
+
+function mergePendingChats(chats, pendingMessages) {
+    const merged = (Array.isArray(chats) ? chats : []).map((chat) => ({ ...chat }));
+    for (const message of pendingMessages) {
+        const chatId = String(message.wx_id || '').trim();
+        const existing = merged.find((chat) => String(chat?.chat_id || '').trim() === chatId);
+        if (existing) {
+            existing.message_count = Number(existing.message_count || 0) + 1;
+            continue;
+        }
+        merged.push({
+            chat_id: chatId,
+            display_name: message.chat_display_name || message.display_name || chatId,
+            message_count: 1,
+        });
+    }
+    return merged;
+}
+
 function renderMessageFailureState(page, message, deps = {}) {
     const container = page.$('#all-messages');
     if (!container) {
@@ -209,11 +299,21 @@ export async function fetchMessages(page, { append, requestSeq }, deps = {}) {
         }
 
         const nextMessages = Array.isArray(result.messages) ? result.messages : [];
-        page._messages = append ? [...page._messages, ...nextMessages] : nextMessages;
-        page._chats = Array.isArray(result.chats) ? result.chats : [];
-        page._total = Number(result.total || 0);
+        const pendingMessages = append
+            ? []
+            : await loadPendingSourceMessages(currentApi, page, nextMessages);
+        if (!isLatestMessagesRequest(page, activeRequestSeq)) {
+            return;
+        }
+        page._messages = append
+            ? [...page._messages, ...nextMessages]
+            : [...pendingMessages, ...nextMessages];
+        page._chats = mergePendingChats(result.chats, pendingMessages);
+        page._total = Number(result.total || 0) + (append ? 0 : pendingMessages.length);
         page._hasMore = Boolean(result.has_more);
-        page._offset = page._messages.length;
+        page._offset = append
+            ? Math.max(0, Number(page._offset || 0) + nextMessages.length)
+            : nextMessages.length;
         page._lastLoadedAt = Date.now();
         page._pendingReplyStats = await loadPendingReplyStats(currentApi);
 

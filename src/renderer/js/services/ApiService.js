@@ -138,9 +138,8 @@ class ApiService {
                     ...config,
                     signal: controller.signal,
                 });
-                clearTimeout(timer);
-
                 const data = await this._parseResponseData(response);
+                clearTimeout(timer);
                 if (response.ok) {
                     return data ?? {};
                 }
@@ -231,7 +230,8 @@ class ApiService {
         if (contentType.includes('application/json')) {
             try {
                 return await response.json();
-            } catch (_) {
+            } catch (error) {
+                if (error?.name === 'AbortError') throw error;
                 const parseError = new Error('Backend returned invalid JSON');
                 parseError.code = 'invalid_json';
                 parseError.status = Number(response.status || 500);

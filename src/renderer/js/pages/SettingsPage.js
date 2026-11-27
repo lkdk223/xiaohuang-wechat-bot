@@ -72,6 +72,7 @@ const SETTINGS_CARD_META = new Map([
     ['模型与认证', { groups: ['model'], order: 30 }],
     ['LangChain Runtime', { groups: ['model', 'advanced'], order: 40 }],
     ['机器人设置', { groups: ['reply'], order: 50 }],
+    ['联网搜索', { groups: ['model', 'reply'], order: 55 }],
     ['系统提示', { groups: ['reply'], order: 60 }],
     ['提示词预览', { groups: ['reply'], order: 70 }],
     ['群聊与发送', { groups: ['reply'], order: 80 }],
@@ -180,10 +181,13 @@ export class SettingsPage extends PageController {
         this._handleMainScroll();
         const runtimeVersion = Number(this.getState('bot.status.config_snapshot.version') || 0);
         if (
-            this._pendingConfigReload
-            || !this._loaded
-            || (runtimeVersion && runtimeVersion > this._lastConfigVersion)
-            || this._localAuthSyncState?.refreshing
+            !this._hasPendingChanges
+            && (
+                this._pendingConfigReload
+                || !this._loaded
+                || (runtimeVersion && runtimeVersion > this._lastConfigVersion)
+                || this._localAuthSyncState?.refreshing
+            )
         ) {
             await this.loadSettings({ preserveFeedback: true });
         } else {

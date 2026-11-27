@@ -3,6 +3,32 @@ import assert from 'node:assert/strict';
 
 import { apiService } from '../../src/renderer/js/services/ApiService.js';
 
+test('api request timeout covers JSON body consumption', async (t) => {
+    t.mock.method(apiService, 'init', async () => {});
+    const previous = apiService.backendRequest;
+    apiService.backendRequest = null;
+    let timerCallback;
+    let cleared = false;
+    t.mock.method(globalThis, 'setTimeout', (callback) => { timerCallback = callback; return 1; });
+    t.mock.method(globalThis, 'clearTimeout', () => { cleared = true; });
+    t.mock.method(globalThis, 'fetch', async (_url, { signal }) => ({
+        ok: true, status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => {
+            if (!cleared) timerCallback();
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            return {};
+        },
+    }));
+    try {
+        await assert.rejects(apiService.request('/api/status', {}, 0),
+            (error) => error.code === 'timeout');
+        assert.equal(cleared, true);
+    } finally {
+        apiService.backendRequest = previous;
+    }
+});
+
 test('api service retries GET by default but does not retry POST by default', async () => {
     const previousFetch = globalThis.fetch;
     const previousInitialized = apiService.initialized;

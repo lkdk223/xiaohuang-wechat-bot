@@ -71,9 +71,13 @@ def should_reply_with_reason(
         if not event.is_at_me:
             return False, "group_not_at_me"
 
-    if bot_cfg.get("whitelist_enabled", False) and event.is_group:
-        whitelist = set(bot_cfg.get("whitelist", []))
+    if bot_cfg.get("whitelist_enabled", False):
+        whitelist = {
+            str(item or "").strip()
+            for item in bot_cfg.get("whitelist", [])
+            if str(item or "").strip()
+        }
         if event.chat_name not in whitelist:
-            return False, "group_not_in_whitelist"
+            return False, "chat_not_in_whitelist"
 
     return True, "ok"

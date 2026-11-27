@@ -252,6 +252,12 @@ function createBackendManager({
         requestJson(method, endpoint, payload = null, timeoutMs = 10000) {
             return new Promise((resolve, reject) => {
                 const body = payload == null ? null : JSON.stringify(payload);
+                const rejectNetworkError = (error) => {
+                    const requestError = error || new Error('后端请求失败');
+                    if (!requestError.code) requestError.code = 'network_error';
+                    requestError.endpoint = requestError.endpoint || endpoint;
+                    reject(requestError);
+                };
                 const buildHttpError = (status, data, fallbackMessage) => {
                     const error = new Error(data?.message || fallbackMessage || `后端请求失败 (${status})`);
                     error.status = Number(status || 500);
@@ -275,6 +281,7 @@ function createBackendManager({
                     },
                     (res) => {
                         const chunks = [];
+                        res.on('error', rejectNetworkError);
                         res.on('data', (chunk) => chunks.push(chunk));
                         res.on('end', () => {
                             const raw = Buffer.concat(chunks).toString('utf8');
@@ -300,14 +307,7 @@ function createBackendManager({
                         });
                     }
                 );
-                req.on('error', (error) => {
-                    const requestError = error || new Error('后端请求失败');
-                    if (!requestError.code) {
-                        requestError.code = 'network_error';
-                    }
-                    requestError.endpoint = requestError.endpoint || endpoint;
-                    reject(requestError);
-                });
+                req.on('error', rejectNetworkError);
                 req.on('timeout', () => {
                     const timeoutError = new Error('请求超时');
                     timeoutError.code = 'timeout';

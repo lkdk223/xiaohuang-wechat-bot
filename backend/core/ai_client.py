@@ -34,7 +34,7 @@ from threading import Lock
 from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 import httpx
-from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .provider_compat import (
     build_anthropic_headers,
@@ -72,6 +72,19 @@ _tiktoken_probe_done = False
 def _is_internal_task_chat_id(chat_id: str) -> bool:
     # Internal augmentation tasks (emotion/facts/etc.) use a "__xxx__" prefix.
     return str(chat_id or "").startswith("__")
+
+
+def _collapse_exact_repeated_reply(text: str) -> str:
+    """Collapse a provider response containing the same complete answer twice."""
+    result = str(text or "").strip()
+    if len(result) < 40:
+        return result
+    for midpoint in range(1, (len(result) // 2) + 2):
+        first = result[:midpoint].rstrip()
+        second = result[midpoint:].lstrip()
+        if len(first) >= 18 and first == second:
+            return first
+    return result
 
 
 def _extract_text(value: object) -> str:
@@ -303,7 +316,7 @@ class AIClient:
         self._chat_locks: Dict[str, asyncio.Lock] = {}
         
         # 请求去重：存储正在处理的请求 {(chat_id, user_text_hash): Future}
-        self._pending_requests: Dict[Tuple[str, int], asyncio.Future] = {}
+        self._pending_requests: Dict[Tuple[str, str, Optional[str]], asyncio.Future] = {}
         
         # 请求统计
         self._stats = {
@@ -438,13 +451,16 @@ class AIClient:
         return contents, "\n\n".join(part for part in system_parts if part).strip()
 
     def _build_openai_codex_payload(self, messages: Iterable[dict]) -> dict:
+        # The ChatGPT-backed Codex endpoint is not the public Responses API and
+        # rejects ``max_output_tokens`` and ``temperature``.  Let that endpoint
+        # manage those values for both health probes and normal replies.
         return build_openai_responses_payload(
             model=self.model,
             messages=messages,
             stream=True,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            max_completion_tokens=self.max_completion_tokens,
+            temperature=None,
+            max_tokens=None,
+            max_completion_tokens=None,
             reasoning_effort=self.reasoning_effort,
         )
 
@@ -866,12 +882,12 @@ class AIClient:
     ) -> Optional[str]:
         """调用模型并返回回复文本，失败返回 None。"""
         # 请求去重
-        req_key = (chat_id, user_text)
+        req_key = (chat_id, user_text, image_path or None)
         if req_key in self._pending_requests:
             self._stats["deduplicated_requests"] += 1
             logging.info("检测到重复请求（%s），等待现有任务完成...", chat_id)
             try:
-                return await self._pending_requests[req_key]
+                return await asyncio.shield(self._pending_requests[req_key])
             except Exception as exc:
                 logging.warning("等待重复请求结果失败: %s", exc)
                 return None
@@ -884,8 +900,16 @@ class AIClient:
             self._stats["total_requests"] += 1
             lock = self._get_chat_lock(chat_id)
             async with lock:
+                image_kwargs = {}
+                if image_path:
+                    from ..utils.image_processing import process_image_for_api
+
+                    image_kwargs["base64_image"] = (
+                        await asyncio.to_thread(process_image_for_api, image_path)
+                    ) or ""
                 messages = self._build_messages(
-                    chat_id, user_text, system_prompt, memory_context, image_path
+                    chat_id, user_text, system_prompt, memory_context, image_path,
+                    **image_kwargs,
                 )
                 try:
                     async for attempt in AsyncRetrying(
@@ -962,7 +986,7 @@ class AIClient:
                                         )
                                         raise RuntimeError(normalized_error.message) from exc
                                 normalized = normalize_chat_result(data)
-                                reply = normalized.text
+                                reply = _collapse_exact_repeated_reply(normalized.text)
                                 if not reply and _is_internal_task_chat_id(chat_id):
                                     reply = normalized.reasoning
                                     if reply:
@@ -989,6 +1013,9 @@ class AIClient:
                     if not future.done():
                         future.set_result(None)
                     return None
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
         except Exception as e:
             if not future.done():
                 future.set_exception(e)
@@ -1085,6 +1112,7 @@ class AIClient:
         system_prompt: Optional[str] = None,
         memory_context: Optional[Iterable[dict]] = None,
         image_path: Optional[str] = None,
+        base64_image: Optional[str] = None,
     ) -> List[dict]:
         self._prune_histories()
         history = list(self._histories.get(chat_id, deque()))
@@ -1092,6 +1120,11 @@ class AIClient:
             self._touch_history(chat_id)
         prompt = self.system_prompt if system_prompt is None else system_prompt
         memory_messages = self._normalize_memory_context(memory_context)
+        # The bot persists every exchange before the next request.  Replaying
+        # both that database context and this client's private history sends
+        # the same conversation twice and encourages repetitive answers.
+        if memory_messages:
+            history = []
         memory_header = None
         if memory_messages:
             memory_header = {
@@ -1130,12 +1163,14 @@ class AIClient:
         if image_path:
             # 引入图片处理
             from ..utils.image_processing import process_image_for_api
+            from ..utils.message import build_visual_user_prompt
             
-            base64_image = process_image_for_api(image_path)
+            if base64_image is None:
+                base64_image = process_image_for_api(image_path)
             
             if base64_image:
                 content_payload = [
-                    {"type": "text", "text": user_text or "这张图片里有什么？"},
+                    {"type": "text", "text": build_visual_user_prompt(user_text)},
                     {
                         "type": "image_url",
                         "image_url": {

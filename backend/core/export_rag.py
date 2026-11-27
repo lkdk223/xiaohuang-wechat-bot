@@ -56,7 +56,7 @@ class ExportChatRAG:
         self.max_context_chars = 900
         self.prefer_recent = True
         self.max_parallel_embeddings = 4
-        self.self_name = "知有"
+        self.self_name = "小黄"
         self.manifest_path = str(data_root / "export_rag_manifest.json")
 
         self.last_scan_at: Optional[float] = None
@@ -88,7 +88,7 @@ class ExportChatRAG:
         self.max_parallel_embeddings = as_int(
             bot_cfg.get("export_rag_max_parallel_embeddings", 4), 4, min_value=1
         )
-        self.self_name = str(bot_cfg.get("self_name") or "知有").strip() or "知有"
+        self.self_name = str(bot_cfg.get("self_name") or "小黄").strip() or "小黄"
 
     def get_status(self) -> Dict[str, Any]:
         return {

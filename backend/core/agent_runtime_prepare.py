@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from ..utils.common import as_int
 from ..utils.config import resolve_system_prompt
 from ..utils.image_processing import process_image_for_api
+from ..utils.message import build_visual_user_prompt
 from .rag import RetrievalService
 
 logger = logging.getLogger(__name__)
@@ -34,13 +35,16 @@ async def resolve_context_task(
     budget = remaining_prepare_budget(runtime, started)
     if timeout_sec is not None:
         budget = min(budget, timeout_sec)
-    if budget <= 0:
+    if budget <= 0 and not task.done():
         skipped_context_steps.append(step_name)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         return None
 
     try:
+        # Parallel work already completed needs no additional waiting budget.
+        if task.done():
+            return task.result()
         return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
     except asyncio.TimeoutError:
         skipped_context_steps.append(step_name)
@@ -96,40 +100,47 @@ async def load_context_node(runtime: Any, state: Dict[str, Any]) -> Dict[str, An
             )
         )
 
-    context_result = await resolve_context_task(
-        runtime,
-        context_task,
-        step_name="recent_context",
-        started=started,
-        skipped_context_steps=skipped_context_steps,
-        warning_message=f"短期记忆加载失败 [{chat_id}]",
-    )
-    if context_result:
-        memory_context = list(context_result or [])
-        short_term_preview = [
-            str(item.get("content") or "").strip()
-            for item in memory_context[:3]
-            if isinstance(item, dict) and str(item.get("content") or "").strip()
-        ]
+    try:
+        context_result = await resolve_context_task(
+            runtime,
+            context_task,
+            step_name="recent_context",
+            started=started,
+            skipped_context_steps=skipped_context_steps,
+            warning_message=f"短期记忆加载失败 [{chat_id}]",
+        )
+        if context_result:
+            memory_context = list(context_result or [])
+            short_term_preview = [
+                str(item.get("content") or "").strip()
+                for item in memory_context[:3]
+                if isinstance(item, dict) and str(item.get("content") or "").strip()
+            ]
 
-    user_profile = await resolve_context_task(
-        runtime,
-        profile_task,
-        step_name="user_profile",
-        started=started,
-        skipped_context_steps=skipped_context_steps,
-        warning_message=f"用户画像加载失败 [{chat_id}]",
-        timeout_sec=runtime.prepare_optional_timeout_sec,
-    )
-    retrieval_bundle = await resolve_context_task(
-        runtime,
-        retrieval_task,
-        step_name="retrieval",
-        started=started,
-        skipped_context_steps=skipped_context_steps,
-        warning_message=f"RAG context loading failed [{chat_id}]",
-        timeout_sec=getattr(runtime, "prepare_retrieval_timeout_sec", runtime.prepare_optional_timeout_sec),
-    )
+        user_profile = await resolve_context_task(
+            runtime,
+            profile_task,
+            step_name="user_profile",
+            started=started,
+            skipped_context_steps=skipped_context_steps,
+            warning_message=f"用户画像加载失败 [{chat_id}]",
+            timeout_sec=runtime.prepare_optional_timeout_sec,
+        )
+        retrieval_bundle = await resolve_context_task(
+            runtime,
+            retrieval_task,
+            step_name="retrieval",
+            started=started,
+            skipped_context_steps=skipped_context_steps,
+            warning_message=f"RAG context loading failed [{chat_id}]",
+            timeout_sec=getattr(runtime, "prepare_retrieval_timeout_sec", runtime.prepare_optional_timeout_sec),
+        )
+    finally:
+        tasks = [task for task in (context_task, profile_task, retrieval_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     retrieval_metadata: Dict[str, Any] = {}
     if retrieval_bundle is not None:
         retrieval_messages = list(getattr(retrieval_bundle, "messages", []) or [])
@@ -178,14 +189,17 @@ async def build_prompt_node(runtime: Any, state: Dict[str, Any]) -> Dict[str, An
         state.get("current_emotion"),
         list(state.get("memory_context") or []),
     )
-    prompt_messages = build_prompt_messages(
-        runtime,
-        system_prompt=system_prompt,
-        memory_context=list(state.get("memory_context") or []),
-        user_text=str(state.get("user_text") or ""),
-        image_path=state.get("image_path"),
-        event=state.get("event"),
-    )
+    prompt_kwargs = {
+        "system_prompt": system_prompt,
+        "memory_context": list(state.get("memory_context") or []),
+        "user_text": str(state.get("user_text") or ""),
+        "image_path": state.get("image_path"),
+        "event": state.get("event"),
+    }
+    if state.get("image_path"):
+        prompt_messages = await asyncio.to_thread(build_prompt_messages, runtime, **prompt_kwargs)
+    else:
+        prompt_messages = build_prompt_messages(runtime, **prompt_kwargs)
     timings = dict(state.get("timings") or {})
     timings["build_prompt_sec"] = round(time.perf_counter() - started, 4)
     return {
@@ -246,7 +260,7 @@ def build_prompt_messages(
             messages.append(
                 human_message(
                     content=[
-                        {"type": "text", "text": user_text or "这张图片里有什么？"},
+                        {"type": "text", "text": build_visual_user_prompt(final_user_text)},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},

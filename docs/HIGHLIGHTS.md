@@ -1,5 +1,17 @@
 # 项目亮点
 
+## 熟人群聊式自然回复
+
+- 人物身份与微信表达纪律分层，联系人覆盖也不会丢失短回复、少反问和群聊边界。
+- 根据输入分量动态控制输出，不用固定小作文或固定一句话模板。
+- 保留观点与轻微分歧，同时禁止编造经历和真人冒充，兼顾自然度与可信边界。
+
+## 显式 image2 图片生成
+
+- 通过 `/画图 描述` 调用 GPT Image 2，并经统一传输契约发送 PNG；普通闲聊不触发付费生成。
+- 独立 API 凭据，沿用白名单/暂停/自动回复策略，生成后再次检查发送许可。
+- 单任务、冷却与不自动重试约束，发送失败保留本机结果；需用户配置 API Key 后实测微信送图。
+
 > **适用场景**：产品对外宣传、项目介绍页面、技术交流展示
 >
 > 这份文档用于集中展示当前项目最值得对外强调的能力：差异化定位、核心亮点、技术难点与落地方案。
@@ -31,7 +43,7 @@
 
 直接体现为：
 
-- 微信入口抽象为 `BaseTransport`，主实现为 `wcferry`
+- 微信入口抽象为 `BaseTransport`，支持 `wcferry` 与微信 4.1+ 可见界面自动化 `pyweixin`；后者默认在单一微信主窗口中按侧边栏未读/预览变化切换精确白名单会话，校验右侧会话名后监听私聊和群聊文本，并把图片/表情包可见帧送入多模态理解链
 - AI 主链路由 `LangChain + LangGraph` 编排
 - 控制面同时覆盖 `Quart API + Electron`
 - 回复之后仍有后台事实提取和记忆写回，不阻塞首响应
@@ -111,6 +123,8 @@
 
 - 会话级锁，避免同一聊天并发写乱上下文
 - Embedding 缓存和 pending 去重，减少重复请求
+  - 直连聊天、SSE 与探测按运行时复用 HTTP 客户端，减少重复建连；不同运行时隔离，关闭时统一释放。线上延迟收益尚待测量。
+  - Embedding 内存缓存最多 256 条，满容量时先清过期项，避免不同查询持续累积；请求取消相互隔离，失败后允许重试。
 - `load_context` 阶段并发执行，压缩首响应等待时间
 - `MemoryManager.get_recent_context_batch()` 批量取上下文，减少多会话场景下的数据库往返
 - `AIClient` 共享 `httpx.AsyncClient` 连接池，并用引用计数回收
@@ -271,9 +285,11 @@ Provider 分层策略也更清晰：
 - `backend/core/prompt_governance.py`：Prompt revision 审计账本与回滚逻辑
 - `backend/core/tool_workflow.py`：受控 Agent Tool Workflow、工具白名单和 trace 输出
 - `backend/core/response_cache.py`：精确响应缓存与默认关闭的同上下文语义相似缓存
+  - 多模态用户消息纳入语义缓存摘要边界，防止同附文不同图片串用答案；回归覆盖字典与具有 type/content/additional_kwargs 字段的模拟消息对象。
 - `backend/api.py`：`/api/status`、`/api/metrics`、本机访问限制、配置接口、Prompt 回滚和 Tool Workflow 接口
 - `backend/transports/base.py`：传输层抽象边界
 - `backend/transports/wcferry_adapter.py`：版本门禁、管理员权限校验、消息接收通道初始化与状态暴露
+- `backend/transports/pyweixin_adapter.py`：微信 4.1+ 白名单私聊/群聊 UI 自动化、群消息方向识别与中性发送者回退、图片/表情包当前帧捕获、支付及其他媒体内容拦截
 - `src/main/diagnostics-snapshot.js`：自动脱敏的本机诊断支持包导出
 - `src/main/ipc.js`：桌面端后端请求 allowlist、Prompt 回滚 revision 路径约束和 Tool Workflow 转发边界
 - `tests/test_agent_runtime.py`：运行时上下文聚合、精确/语义缓存命中、模型侧 Tool Calling、TraceLogger-lite 状态接入、Cross-Encoder 精排测试

@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 # 全局变量用于 reload
 _ai_module = None
+_agent_runtime_module = None
 _last_ai_client_error = ""
 _last_transport_error = ""
 
@@ -305,6 +306,10 @@ async def _select_specific_candidate_variants(
         probe_ok = False
         try:
             probe_ok = bool(await client.probe())
+        except asyncio.CancelledError:
+            if hasattr(client, "close"):
+                await client.close()
+            raise
         except Exception as exc:
             reason = f"\u6307\u5b9a\u9884\u8bbe {candidate_name} \u63a2\u6d4b\u5f02\u5e38\uff1a{exc}"
             _set_last_ai_client_error(reason)
@@ -434,6 +439,10 @@ async def select_ai_client(
             probe_ok = False
             try:
                 probe_ok = bool(await client.probe())
+            except asyncio.CancelledError:
+                if hasattr(client, "close"):
+                    await client.close()
+                raise
             except Exception as exc:
                 reason = f"\u9884\u8bbe {candidate_name} \u63a2\u6d4b\u5f02\u5e38\uff1a{exc}"
                 _set_last_ai_client_error(reason)
@@ -500,7 +509,7 @@ async def reconnect_wechat(
     bot_cfg: Optional[Dict[str, Any]] = None,
     ai_client: Optional[Any] = None,
 ) -> Optional[Any]:
-    """Reconnect the supported WCFerry transport with bounded retries."""
+    """Reconnect the configured WeChat transport with bounded retries."""
     if bot_cfg is None:
         config_path = None
         try:
@@ -518,25 +527,40 @@ async def reconnect_wechat(
 
     from ..transports import TransportUnavailableError, WcferryTransport
 
+    backend = str(bot_cfg.get("transport_backend") or "wcferry").strip().lower()
+    transport_cls: Any = WcferryTransport
+    unavailable_errors: tuple[type[BaseException], ...] = (TransportUnavailableError,)
+    if backend == "pyweixin":
+        from ..transports.pyweixin_adapter import (
+            PyWeixinTransport,
+            TransportUnavailableError as PyWeixinUnavailableError,
+        )
+
+        transport_cls = PyWeixinTransport
+        unavailable_errors = (TransportUnavailableError, PyWeixinUnavailableError)
+    elif backend != "wcferry":
+        _set_last_transport_error(f"不支持的微信传输后端：{backend}")
+        return None
+
     logging.warning("Preparing WeChat reconnect: %s", reason)
     for attempt in range(policy.max_retries + 1):
         try:
             client = await asyncio.to_thread(
-                WcferryTransport,
+                transport_cls,
                 bot_cfg,
                 ai_client=ai_client,
             )
             _set_last_transport_error("")
-            logging.info("WCFerry transport initialized: %s", client.backend_name)
+            logging.info("WeChat transport initialized: %s", client.backend_name)
             return client
-        except TransportUnavailableError as exc:
+        except unavailable_errors as exc:
             _set_last_transport_error(str(exc))
             if attempt >= policy.max_retries:
-                logging.error("WCFerry transport unavailable: %s", exc)
+                logging.error("WeChat transport unavailable: %s", exc)
                 break
             wait = min(policy.max_delay_sec, policy.base_delay_sec * (1.5**attempt))
             logging.warning(
-                "WCFerry transport unavailable (attempt %s): %s; retrying in %s seconds",
+                "WeChat transport unavailable (attempt %s): %s; retrying in %s seconds",
                 attempt + 1,
                 exc,
                 round(wait, 2),
@@ -638,7 +662,7 @@ async def reload_ai_module(ai_client: Optional[AIClient] = None) -> None:
     
     用于开发调试，在不重启主进程的情况下更新 AI 客户端代码。
     """
-    global _ai_module
+    global _ai_module, _agent_runtime_module
     if ai_client and hasattr(ai_client, "close"):
         await ai_client.close()
     if _ai_module is None:
@@ -646,3 +670,8 @@ async def reload_ai_module(ai_client: Optional[AIClient] = None) -> None:
 
         _ai_module = ai_module_ref
     _ai_module = importlib.reload(_ai_module)
+    if _agent_runtime_module is None:
+        from ..core import agent_runtime as agent_runtime_module_ref
+
+        _agent_runtime_module = agent_runtime_module_ref
+    _agent_runtime_module = importlib.reload(_agent_runtime_module)

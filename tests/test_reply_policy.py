@@ -122,7 +122,29 @@ def test_reply_policy_respects_group_whitelist_mode():
 
     assert result["applied_rule"] == "group_mode"
     assert result["trigger_reason"] == "group_not_in_whitelist"
-    assert result["should_queue"] is True
+
+
+def test_pyweixin_private_whitelist_defaults_to_auto_reply():
+    event = _event(chat_name="小王", is_group=False)
+    result = evaluate_reply_policy(
+        event,
+        bot_cfg={
+            "transport_backend": "pyweixin",
+            "whitelist": ["测试联系人", "小王"],
+            "pyweixin_whitelist_auto_reply": True,
+            "reply_policy": {
+                "default_mode": "manual",
+                "new_contact_mode": "manual",
+            },
+        },
+        user_text="你好",
+        draft_reply="你好呀",
+        has_existing_history=False,
+    )
+
+    assert result["mode"] == "auto"
+    assert result["should_queue"] is False
+    assert result["applied_rule"] == "pyweixin_whitelist"
 
 
 def test_reply_policy_prefers_stable_raw_chat_id_but_keeps_legacy_override_match():

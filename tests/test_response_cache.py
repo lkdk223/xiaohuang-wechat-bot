@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from backend.core.response_cache import ResponseCache
 
 
@@ -47,6 +49,38 @@ def test_response_cache_is_disabled_by_default():
     assert cache.get(key) is None
     assert cache.set(key, answer_text="answer") is False
     assert cache.get_status()["skipped"] == 2
+
+
+@pytest.mark.parametrize("use_message_object", [False, True, "runtime"])
+def test_semantic_cache_separates_multimodal_user_messages(use_message_object):
+    from types import SimpleNamespace
+
+    cache = ResponseCache({"enabled": True, "semantic_enabled": True})
+
+    def image_key(image):
+        content = [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": image}},
+        ]
+        message = (
+            SimpleNamespace(type="human", content=content, additional_kwargs={})
+            if use_message_object else {"role": "user", "content": content}
+        )
+        if use_message_object == "runtime":
+            from backend.core.agent_runtime import _human_message
+            message = _human_message(content=content)
+        return cache.build_key(
+            provider_id="test", model="test", chat_id="test",
+            user_text="what is this", system_prompt="test",
+            prompt_messages=[message],
+        )
+
+    first = image_key("data:image/png;base64,first")
+    second = image_key("data:image/png;base64,second")
+    cache.set(first, answer_text="first image", query_embedding=[1.0, 0.0])
+    assert cache.get_semantic(second, [1.0, 0.0]) is None
+    assert cache.get(first).answer_text == "first image"
+    assert "data:image" not in json.dumps(first.to_dict())
 
 
 def test_response_cache_key_is_context_bound_and_does_not_expose_raw_text():
@@ -173,6 +207,28 @@ def test_response_cache_ttl_expiry(monkeypatch):
     assert status["expired"] == 1
     assert status["misses"] == 1
     assert status["size"] == 0
+
+
+def test_response_cache_prefers_expired_entry_over_valid_lru(monkeypatch):
+    import backend.core.response_cache as response_cache_module
+
+    now = 100.0
+    monkeypatch.setattr(response_cache_module.time, "time", lambda: now)
+    cache = ResponseCache({"enabled": True, "ttl_sec": 10, "max_entries": 2})
+    old = _build_key(cache, user_text="old")
+    valid = _build_key(cache, user_text="valid")
+    new = _build_key(cache, user_text="new")
+    cache.set(old, answer_text="old")
+    now = 105.0
+    cache.set(valid, answer_text="valid")
+    now = 109.0
+    assert cache.get(old) is not None
+    now = 110.0
+    cache.set(new, answer_text="new")
+    assert cache.get(valid) is not None
+    assert cache.get(new) is not None
+    assert cache.get_status()["expired"] == 1
+    assert cache.get_status()["evictions"] == 0
 
 
 def test_response_cache_evicts_oldest_entry(monkeypatch):

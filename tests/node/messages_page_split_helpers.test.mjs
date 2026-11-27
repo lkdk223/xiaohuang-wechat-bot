@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
     fetchMessages,
     handleRealtimeMessage,
+    pendingReplyToMessage,
     refreshMessages,
     renderMessagesPage,
 } from '../../src/renderer/js/pages/messages/data-controller.js';
@@ -13,6 +14,7 @@ import {
 } from '../../src/renderer/js/pages/messages/detail-controller.js';
 import { renderMessagesPageShell } from '../../src/renderer/js/app-shell/pages/messages.js';
 import { bindMessagesPage } from '../../src/renderer/js/pages/messages/page-shell.js';
+import { MessagesPage } from '../../src/renderer/js/pages/MessagesPage.js';
 import { installDomStub } from './dom-stub.mjs';
 
 async function withDom(run) {
@@ -209,6 +211,85 @@ test('messages data helper keeps messages visible when pending stats fail', asyn
     assert.equal(selectors['#message-filter-summary'].textContent.includes('待审批回复'), false);
     assert.equal(toast.calls.length, 0);
 }));
+
+test('messages data helper exposes pending draft source in the message center', async () => withDom(async ({ document }) => {
+    const selectors = {
+        '#all-messages': document.createElement('div'),
+        '#message-chat-filter': document.createElement('select'),
+        '#message-filter-summary': document.createElement('div'),
+        '#message-total-count': document.createElement('div'),
+        '#btn-load-more-messages': document.createElement('button'),
+    };
+    const page = createMessagesPage({ bot: { connected: true } }, selectors);
+
+    await fetchMessages(page, { append: false }, {
+        apiService: {
+            getMessages: async () => ({
+                success: true,
+                messages: [],
+                chats: [],
+                total: 0,
+                has_more: false,
+            }),
+            listPendingReplies: async () => ({
+                success: true,
+                items: [{
+                    id: 17,
+                    chat_id: 'friend:mingchuan',
+                    draft_reply: '你好呀',
+                    status: 'pending',
+                    created_at: 100,
+                    metadata: {
+                        chat_name: '测试联系人',
+                        sender: '测试联系人',
+                        user_text: '测试',
+                        timestamp: 100,
+                    },
+                }],
+            }),
+            getReplyPolicies: async () => ({
+                success: true,
+                pending_stats: { pending: 1 },
+            }),
+        },
+    });
+
+    assert.equal(page._messages.length, 1);
+    assert.equal(page._messages[0].content, '测试');
+    assert.equal(page._messages[0].metadata.pending_reply_id, 17);
+    assert.equal(selectors['#message-chat-filter'].children.length, 2);
+    assert.equal(selectors['#message-chat-filter'].children[1].textContent, '测试联系人 (1)');
+    assert.equal(selectors['#all-messages'].textContent.includes('测试'), true);
+    assert.equal(selectors['#message-total-count'].textContent.includes('1/1'), true);
+}));
+
+test('pending reply source conversion keeps safe chat identity', () => {
+    const message = pendingReplyToMessage({
+        id: 5,
+        chat_id: '测试联系人',
+        created_at: 12,
+        metadata: { chat_name: '测试联系人', sender: '测试联系人', user_text: '在吗' },
+    });
+
+    assert.equal(message.wx_id, '测试联系人');
+    assert.equal(message.sender_display_name, '测试联系人');
+    assert.equal(message.content, '在吗');
+    assert.equal(message.is_self, false);
+});
+
+test('messages page refreshes on enter and clears its live refresh timer on leave', async () => {
+    const page = new MessagesPage();
+    page._initialized = true;
+    page._active = false;
+    page.getState = () => false;
+    page.$ = () => null;
+
+    await page.onEnter();
+    assert.notEqual(page._refreshTimer, null);
+
+    await page.onLeave();
+    assert.equal(page._refreshTimer, null);
+});
 
 test('messages data helper applies realtime message filter and renders list', async () => withDom(async ({ document }) => {
     const selectors = {

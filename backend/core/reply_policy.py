@@ -174,6 +174,19 @@ def evaluate_reply_policy(
                 result["should_queue"] = True
                 result["trigger_reason"] = "group_not_in_whitelist"
                 return result
+    elif (
+        str(config.get("transport_backend") or "").strip().lower() == "pyweixin"
+        and bool(config.get("pyweixin_whitelist_auto_reply", True))
+        and str(getattr(event, "chat_name", "") or "").strip()
+        in {
+            str(item or "").strip()
+            for item in list(config.get("whitelist") or [])
+            if str(item or "").strip()
+        }
+    ):
+        result["mode"] = AUTO_MODE
+        result["applied_rule"] = "pyweixin_whitelist"
+        return result
     elif not has_existing_history:
         new_contact_mode = str(policy.get("new_contact_mode") or MANUAL_MODE).strip().lower()
         result["mode"] = new_contact_mode

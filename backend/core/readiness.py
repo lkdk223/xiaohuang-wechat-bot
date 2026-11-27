@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from packaging.version import InvalidVersion, Version
+
 from backend.shared_config import get_app_config_path
 from backend.core.oauth_support import get_preset_auth_summary
 from backend.utils.text_codec import decode_text_bytes
@@ -31,6 +33,8 @@ DEPLOYMENT_TARGET_DESKTOP = "desktop"
 DEPLOYMENT_TARGET_WEB_API = "web-api"
 REQUIRED_PACKAGES: Sequence[str] = ("httpx", "openai", "quart", "wcferry")
 WEB_API_REQUIRED_PACKAGES: Sequence[str] = ("httpx", "openai", "quart")
+PYWEIXIN_REQUIRED_PACKAGES: Sequence[str] = ("httpx", "openai", "quart", "pyweixin")
+PYWEIXIN_MINIMUM_VERSION = "4.1.6"
 DEFAULT_READINESS_TTL_SEC = 5.0
 
 
@@ -328,6 +332,47 @@ def _check_wechat_compatibility(
     )
 
 
+def _check_pyweixin_compatibility(
+    wechat_path: str,
+    *,
+    version_getter: Optional[Callable[[str], Optional[str]]] = None,
+) -> Dict[str, Any]:
+    current_path = str(wechat_path or "").strip()
+    if not current_path:
+        return _build_check(
+            "wechat_compatibility",
+            "微信 4.x 界面自动化兼容性",
+            passed=None,
+            message="未检测到微信安装路径，跳过兼容性检查",
+            blocking=False,
+        )
+    current_version = str((version_getter or detect_wechat_version)(current_path) or "").strip()
+    if not current_version:
+        return _build_check(
+            "wechat_compatibility",
+            "微信 4.x 界面自动化兼容性",
+            passed=None,
+            message="未读取到微信版本",
+            blocking=False,
+        )
+    try:
+        passed = Version(current_version) >= Version(PYWEIXIN_MINIMUM_VERSION)
+    except InvalidVersion:
+        passed = False
+    return _build_check(
+        "wechat_compatibility",
+        "微信 4.x 界面自动化兼容性",
+        passed=passed,
+        message=(
+            f"当前微信版本 {current_version}，pyweixin 要求 {PYWEIXIN_MINIMUM_VERSION}+"
+        ),
+        blocking=True,
+        action="retry",
+        action_label="重新检查",
+        hint="请保持当前微信 4.x 已启动并登录。",
+    )
+
+
 def _check_transport_config(config: dict) -> Dict[str, Any]:
     bot_cfg = config.get("bot", {}) if isinstance(config, dict) else {}
     if not isinstance(bot_cfg, dict) or not bot_cfg:
@@ -341,6 +386,7 @@ def _check_transport_config(config: dict) -> Dict[str, Any]:
             action_label="前往设置",
         )
 
+    backend = str(bot_cfg.get("transport_backend") or "wcferry").strip().lower()
     required_version = str(
         bot_cfg.get("required_wechat_version") or OFFICIAL_SUPPORTED_WECHAT_VERSION
     ).strip()
@@ -350,7 +396,7 @@ def _check_transport_config(config: dict) -> Dict[str, Any]:
         "传输配置",
         passed=True,
         message=(
-            f"required_wechat_version={required_version}; "
+            f"transport_backend={backend}; required_wechat_version={required_version}; "
             f"silent_mode_required={silent_mode_required}"
         ),
         blocking=False,
@@ -453,20 +499,43 @@ def build_readiness_report(
         ]
     else:
         install_check, wechat_path = _check_wechat_installation(wechat_path_getter)
-        checks = [
-            _check_python_version(),
-            _check_dependencies(),
-            _check_admin_permission(admin_checker),
-            _check_wechat_process(process_counter),
-            install_check,
-            _check_wechat_compatibility(
-                wechat_path,
-                version_getter=wechat_version_getter,
-                supported_versions_getter=supported_versions_getter,
-            ),
-            _check_transport_config(config),
-            _check_api_config(config),
-        ]
+        bot_cfg = config.get("bot", {}) if isinstance(config, dict) else {}
+        backend = str((bot_cfg or {}).get("transport_backend") or "wcferry").strip().lower()
+        if backend == "pyweixin":
+            checks = [
+                _check_python_version(),
+                _check_dependencies(PYWEIXIN_REQUIRED_PACKAGES),
+                _build_check(
+                    "admin_permission",
+                    "管理员权限",
+                    passed=None,
+                    message="pyweixin 界面自动化不需要管理员权限",
+                    blocking=False,
+                ),
+                _check_wechat_process(process_counter),
+                install_check,
+                _check_pyweixin_compatibility(
+                    wechat_path,
+                    version_getter=wechat_version_getter,
+                ),
+                _check_transport_config(config),
+                _check_api_config(config),
+            ]
+        else:
+            checks = [
+                _check_python_version(),
+                _check_dependencies(),
+                _check_admin_permission(admin_checker),
+                _check_wechat_process(process_counter),
+                install_check,
+                _check_wechat_compatibility(
+                    wechat_path,
+                    version_getter=wechat_version_getter,
+                    supported_versions_getter=supported_versions_getter,
+                ),
+                _check_transport_config(config),
+                _check_api_config(config),
+            ]
 
     blocking_count = sum(
         1 for check in checks if check.get("status") == "failed" and check.get("blocking")

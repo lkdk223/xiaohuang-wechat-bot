@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import os
 import random
 import time
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from .core.reply_policy import (
 )
 
 from .types import MessageEvent
+from .bot_image_flow import handle_drawing_command
 from .bot_event_flow import (
     handle_control_command as helper_handle_control_command,
     maybe_save_event_image,
@@ -78,8 +80,11 @@ from .utils.logging import (
 )
 from .utils.config_watcher import ConfigReloadWatcher
 from .utils.message import (
+    extract_visual_chat_reply,
+    is_visual_message,
     is_voice_message,
     split_reply_naturally,
+    strip_trailing_visual_reply_emoji,
 )
 from .utils.tools import transcribe_voice_message, estimate_exchange_tokens
 from .utils.ipc import IPCManager
@@ -150,6 +155,7 @@ class WeChatBot:
         self.ignore_names_set: Set[str] = set()
         self.ignore_keywords_list: List[str] = []
         self.recent_outgoing_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self.recent_visual_captures: Dict[str, Dict[str, Any]] = {}
         self.reply_quality_stats: Dict[str, Any] = {
             "attempted": 0,
             "successful": 0,
@@ -253,8 +259,15 @@ class WeChatBot:
     @staticmethod
     def _transport_reconnect_required(changed_paths: List[str]) -> bool:
         transport_paths = {
+            "bot.transport_backend",
             "bot.required_wechat_version",
             "bot.silent_mode_required",
+            "bot.pyweixin_test_contact",
+            "bot.pyweixin_send_enabled",
+            "bot.pyweixin_window_mode",
+            "bot.pyweixin_max_contacts",
+            "bot.whitelist_enabled",
+            "bot.whitelist",
         }
         return any(path in transport_paths for path in changed_paths)
 
@@ -283,6 +296,53 @@ class WeChatBot:
             "success": True,
             "message": "微信传输层已自动重连并生效",
         }
+
+    async def _get_active_transport(self, fallback: BaseTransport) -> BaseTransport:
+        """Return the latest transport after a runtime reconnect.
+
+        The run loop keeps a local transport reference for polling and reply
+        tasks.  A hot reload replaces ``self.wx``; refreshing the local
+        reference each iteration prevents later messages from using the stale
+        pre-reload transport.
+        """
+        async with self.wx_lock:
+            return self.wx or fallback
+
+    async def _poll_transport_messages(
+        self,
+        wx: BaseTransport,
+        *,
+        filter_mute: bool,
+    ) -> Any:
+        """Poll without letting a stuck UI Automation call freeze the bot loop."""
+
+        async def invoke() -> Any:
+            if filter_mute and self._wx_supports_filter_mute is not False:
+                try:
+                    result = await asyncio.to_thread(
+                        wx.poll_new_messages,
+                        filter_mute=True,
+                    )
+                    self._wx_supports_filter_mute = True
+                    return result
+                except TypeError as exc:
+                    if "filter_mute" not in str(exc):
+                        raise
+                    self._wx_supports_filter_mute = False
+                    logging.warning(
+                        "transport filter_mute unsupported; fallback to unfiltered polling"
+                    )
+            return await asyncio.to_thread(wx.poll_new_messages)
+
+        timeout_sec = as_float(self.bot_cfg.get("poll_timeout_sec", 10.0), 10.0)
+        if timeout_sec <= 0:
+            return await invoke()
+        try:
+            return await asyncio.wait_for(invoke(), timeout=timeout_sec)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"微信消息轮询超过 {timeout_sec:g} 秒，监听窗口可能已失效"
+            ) from exc
 
     async def initialize(self) -> Optional[BaseTransport]:
         try:
@@ -538,7 +598,7 @@ class WeChatBot:
         config_reload_sec = as_float(self.bot_cfg.get("config_reload_sec", 2.0), 2.0)
         config_check_ts = 0.0
         
-        last_poll_ok_ts = time.time()
+        last_poll_ok_ts = time.monotonic()
         
         while not self._should_stop():
             try:
@@ -573,10 +633,14 @@ class WeChatBot:
                 for cmd in cmds:
                     await self._execute_ipc_command(wx, cmd)
 
+                # Config/API hot reloads replace self.wx.  Keep the loop-local
+                # reference synchronized so both polling and sending use the
+                # newly configured transport without restarting the bot.
+                wx = await self._get_active_transport(wx)
 
                 # 心跳保活检查
                 keepalive_idle_sec = as_float(self.bot_cfg.get("keepalive_idle_sec", 0.0), 0.0)
-                if keepalive_idle_sec > 0 and (now - last_poll_ok_ts > keepalive_idle_sec):
+                if keepalive_idle_sec > 0 and (time.monotonic() - last_poll_ok_ts > keepalive_idle_sec):
                     reconnect_policy = get_reconnect_policy(self.bot_cfg)
                     wx = await reconnect_wechat(
                         "keepalive 超时",
@@ -589,28 +653,20 @@ class WeChatBot:
                     if wx is None:
                         await asyncio.sleep(reconnect_policy.base_delay_sec)
                         continue
-                    last_poll_ok_ts = time.time()
+                    async with self.wx_lock:
+                        self.wx = wx
+                        self._wx_supports_filter_mute = None
+                    last_poll_ok_ts = time.monotonic()
 
                 # 轮询消息
                 try:
                     filter_mute = bool(self.bot_cfg.get("filter_mute", False))
                     async with self.wx_lock:
-                        if filter_mute and self._wx_supports_filter_mute is not False:
-                            try:
-                                raw = await asyncio.to_thread(
-                                    wx.poll_new_messages,
-                                    filter_mute=True,
-                                )
-                                self._wx_supports_filter_mute = True
-                            except TypeError as exc:
-                                if "filter_mute" not in str(exc):
-                                    raise
-                                self._wx_supports_filter_mute = False
-                                logging.warning("transport filter_mute unsupported; fallback to unfiltered polling")
-                                raw = await asyncio.to_thread(wx.poll_new_messages)
-                        else:
-                            raw = await asyncio.to_thread(wx.poll_new_messages)
-                    last_poll_ok_ts = time.time()
+                        raw = await self._poll_transport_messages(
+                            wx,
+                            filter_mute=filter_mute,
+                        )
+                    last_poll_ok_ts = time.monotonic()
                 except Exception as exc:
                     logging.exception("获取消息异常：%s", exc)
                     reconnect_policy = get_reconnect_policy(self.bot_cfg)
@@ -624,7 +680,14 @@ class WeChatBot:
                         wx.ai_client = self.ai_client
                     if wx is None:
                         await asyncio.sleep(reconnect_policy.base_delay_sec)
+                    else:
+                        async with self.wx_lock:
+                            self.wx = wx
+                            self._wx_supports_filter_mute = None
+                        last_poll_ok_ts = time.monotonic()
                     poll_interval = min(poll_interval_max, poll_interval * poll_backoff)
+                    if wx is not None:
+                        await asyncio.sleep(poll_interval)
                     continue
 
                 events = normalize_new_messages(raw, self.bot_cfg.get("self_name", ""))
@@ -754,7 +817,20 @@ class WeChatBot:
                 new_signature = compute_api_signature(
                     {"api": self.api_cfg, "agent": self.agent_cfg}
                 )
-                if new_signature != self.api_signature:
+                runtime_bot_fields = {
+                    "bot.web_search_enabled",
+                    "bot.web_search_always_on",
+                    "bot.natural_chat_mode",
+                    "bot.system_prompt",
+                    "bot.system_prompt_overrides",
+                    "bot.personalization_enabled",
+                    "bot.profile_inject_in_prompt",
+                    "bot.emotion_inject_in_prompt",
+                }
+                runtime_bot_changed = any(
+                    path in runtime_bot_fields for path in changed_paths
+                )
+                if new_signature != self.api_signature or runtime_bot_changed:
                     if self.bot_cfg.get("reload_ai_client_module", False):
                         await reload_ai_module(self.ai_client)
                     new_client, new_preset = await select_ai_client(
@@ -1056,7 +1132,7 @@ class WeChatBot:
             return
 
         chat_id = build_reply_policy_chat_id(event)
-        now = time.time()
+        now = time.monotonic()
         
         async with self.pending_merge_lock:
             if chat_id not in self.pending_merge_first_ts:
@@ -1145,6 +1221,7 @@ class WeChatBot:
         async with self.sem:
             self._ensure_event_defaults(event)
             trace_id = self._build_event_trace_id(event)
+            image_path: Optional[str] = None
             try:
                 event_state = self._prepare_event_for_processing(event)
                 if event_state == "skip_recent_outgoing_echo":
@@ -1172,6 +1249,22 @@ class WeChatBot:
                     event,
                     trace_id=trace_id,
                 )
+                if is_visual_message(event.msg_type) and not image_path:
+                    self._log_flow(
+                        logging.INFO,
+                        "EVENT.SKIP_VISUAL_WITHOUT_IMAGE",
+                        event=event,
+                        trace_id=trace_id,
+                    )
+                    return
+                if image_path and self._is_duplicate_visual_capture(event, image_path):
+                    self._log_flow(
+                        logging.INFO,
+                        "EVENT.SKIP_DUPLICATE_VISUAL",
+                        event=event,
+                        trace_id=trace_id,
+                    )
+                    return
                 
                 record_incoming_event(self.ipc, event)
                 schedule_incoming_broadcast(self.bot_manager, event)
@@ -1253,6 +1346,11 @@ class WeChatBot:
                         preview=message_log,
                     )
 
+                if await handle_drawing_command(
+                    self, wx, event, user_text_override or event.content, trace_id=trace_id
+                ):
+                    return
+
                 # 5. 核心处理
                 self._log_flow(
                     logging.INFO,
@@ -1279,6 +1377,22 @@ class WeChatBot:
                     error=str(exc),
                 )
                 logging.exception("消息处理异常: %s", exc)
+            finally:
+                # Visual messages may exit early because of filters, pause state,
+                # manual review, an empty model reply, or an exception.  The
+                # prepared request already contains the encoded frame, so the
+                # temporary capture is safe to remove in every branch.
+                if image_path and os.path.exists(image_path):
+                    try:
+                        await asyncio.to_thread(os.remove, image_path)
+                    except OSError as exc:
+                        self._log_flow(
+                            logging.WARNING,
+                            "EVENT.IMAGE_CLEANUP_FAILED",
+                            event=event,
+                            trace_id=trace_id,
+                            error=str(exc),
+                        )
 
     async def _handle_control_command(
         self,
@@ -1482,7 +1596,15 @@ class WeChatBot:
         fast_reply_mode = 0.0 < reply_deadline_sec <= 2.0
         delay_sec = 0.0 if fast_reply_mode else as_float(self.bot_cfg.get("reply_chunk_delay_sec", 0.0), 0.0)
         min_interval = 0.0 if fast_reply_mode else as_float(self.bot_cfg.get("min_reply_interval_sec", 0.2), 0.2)
-        sanitized_reply = self._build_final_reply_text(reply_text)
+        direct_reply = (
+            extract_visual_chat_reply(reply_text)
+            if is_visual_message(getattr(event, "msg_type", None))
+            else reply_text
+        )
+        if is_visual_message(getattr(event, "msg_type", None)):
+            direct_reply = strip_trailing_visual_reply_emoji(direct_reply)
+
+        sanitized_reply = self._build_final_reply_text(direct_reply)
         self._log_flow(
             logging.INFO,
             "SEND.PREPARE",
@@ -1576,6 +1698,32 @@ class WeChatBot:
                 reply=self._reply_preview(sanitized_reply),
             )
         return sanitized_reply
+
+    def _is_duplicate_visual_capture(self, event: MessageEvent, image_path: str) -> bool:
+        """按截图内容拦截 pyweixin 重复暴露的同一视觉气泡。"""
+        if not is_visual_message(getattr(event, "msg_type", None)):
+            return False
+        window_sec = as_float(
+            self.bot_cfg.get("visual_duplicate_window_sec", 90.0),
+            90.0,
+            min_value=0.0,
+        )
+        if window_sec <= 0:
+            return False
+        try:
+            with open(image_path, "rb") as image_file:
+                digest = hashlib.sha256(image_file.read()).hexdigest()
+        except OSError:
+            return False
+        now = time.monotonic()
+        chat_key = str(getattr(event, "chat_name", "") or "")
+        previous = self.recent_visual_captures.get(chat_key)
+        self.recent_visual_captures[chat_key] = {"digest": digest, "seen_at": now}
+        return bool(
+            previous
+            and previous.get("digest") == digest
+            and now - float(previous.get("seen_at", 0.0)) <= window_sec
+        )
 
     def _sanitize_reply_segment(self, reply_text: str) -> str:
         return helper_sanitize_reply_segment(self.bot_cfg, reply_text)
@@ -2379,8 +2527,8 @@ class WeChatBot:
                 logging.debug("获取 transport 状态失败: %s", exc)
         if self.wx:
             return {
-                "transport_backend": "wcferry",
-                "silent_mode": True,
+                "transport_backend": str(self.bot_cfg.get("transport_backend") or "wcferry"),
+                "silent_mode": str(self.bot_cfg.get("transport_backend") or "wcferry") == "wcferry",
                 "wechat_version": "",
                 "required_wechat_version": "",
                 "supports_native_quote": False,
@@ -2389,8 +2537,8 @@ class WeChatBot:
                 "transport_warning": "",
             }
         return {
-            "transport_backend": "wcferry",
-            "silent_mode": True,
+            "transport_backend": str(self.bot_cfg.get("transport_backend") or "wcferry"),
+            "silent_mode": str(self.bot_cfg.get("transport_backend") or "wcferry") == "wcferry",
             "wechat_version": "",
             "required_wechat_version": str(
                 self.bot_cfg.get("required_wechat_version") or ""

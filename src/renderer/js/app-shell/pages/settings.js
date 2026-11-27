@@ -177,6 +177,44 @@ export function renderSettingsPageShell() {
                     </div>
 
                     <div class="settings-card">
+                        <h2 class="settings-card-title">自然聊天</h2>
+                        <label class="form-checkbox form-checkbox-inline">
+                            <input type="checkbox" id="setting-natural-chat-mode">
+                            <span class="form-checkbox-label">启用熟人群聊风格</span>
+                        </label>
+                        <div class="detail-help">根据消息分量控制长度，减少复述、强行反问、模板安慰和无条件附和；直接询问身份时仍会如实回答。</div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h2 class="settings-card-title">联网搜索</h2>
+                        <div class="settings-grid">
+                            <div class="form-group">
+                                <label class="form-checkbox form-checkbox-inline">
+                                    <input type="checkbox" id="setting-web-search-enabled">
+                                    <span class="form-checkbox-label">允许按需联网搜索</span>
+                                </label>
+                                <div class="detail-help">使用 OpenAI / Codex 本机认证时，遇到“帮我搜”、新闻、天气、价格等实时问题会调用网页搜索。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-checkbox form-checkbox-inline">
+                                    <input type="checkbox" id="setting-web-search-always-on">
+                                    <span class="form-checkbox-label">每条消息强制搜索</span>
+                                </label>
+                                <div class="detail-help">通常保持关闭；开启后会增加响应时间和额度消耗。当前网页搜索仅由 OpenAI / Codex Responses 传输提供。</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h2 class="settings-card-title">图片生成（image2）</h2>
+                        <label class="form-checkbox form-checkbox-inline">
+                            <input type="checkbox" id="setting-image-generation-enabled">
+                            <span class="form-checkbox-label">允许明确画图指令</span>
+                        </label>
+                        <div class="detail-help">发送“/画图 一只小狗”调用 GPT Image 2，每次一张。需要启动进程的 OPENAI_API_KEY，单独计费，不复用 Codex 登录。遵守白名单和自动回复策略；每分钟最多一次，不自动重试。</div>
+                    </div>
+
+                    <div class="settings-card">
                         <h2 class="settings-card-title">系统提示</h2>
                         <div class="form-group full-width">
                             <label class="form-label">自定义系统提示词</label>
@@ -812,6 +850,7 @@ export function renderSettingsPageShell() {
                         <div class="form-group full-width">
                             <label class="form-label">白名单（每行一个联系人或群名）</label>
                             <textarea id="setting-whitelist" rows="4" placeholder="联系人1&#10;群聊1&#10;..."></textarea>
+                            <div class="detail-help">微信 4.x 界面自动化模式默认支持最多 8 个白名单私聊或群聊。每行填写一个精确会话名称；删除某一行并保存即可停止监听该会话。</div>
                         </div>
                     </div>
                 </div>

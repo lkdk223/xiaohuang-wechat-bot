@@ -9,10 +9,19 @@ from __future__ import annotations
 
 from .base import BaseTransport
 
-__all__ = ["BaseTransport", "TransportUnavailableError", "WcferryTransport"]
+__all__ = [
+    "BaseTransport",
+    "TransportUnavailableError",
+    "WcferryTransport",
+    "PyWeixinTransport",
+]
 
 
 def __getattr__(name: str):  # type: ignore[no-untyped-def]
+    if name == "PyWeixinTransport":
+        from .pyweixin_adapter import PyWeixinTransport
+
+        return PyWeixinTransport
     if name in {"TransportUnavailableError", "WcferryTransport"}:
         from .wcferry_adapter import TransportUnavailableError, WcferryTransport
 

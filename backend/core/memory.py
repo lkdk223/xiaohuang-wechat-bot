@@ -786,7 +786,7 @@ class MemoryManager:
         wx_ids: Iterable[str],
         limit: int = 20,
     ) -> Dict[str, List[dict]]:
-        """Fetch recent contexts for multiple chats in one query."""
+        """Fetch recent contexts using bounded batches of indexed LIMIT queries."""
         normalized_ids = []
         for raw in wx_ids:
             wx_id = str(raw or "").strip()
@@ -803,30 +803,20 @@ class MemoryManager:
         if limit_val <= 0:
             return {wx_id: [] for wx_id in normalized_ids}
 
-        placeholders = ", ".join("?" for _ in normalized_ids)
-        sql = f"""
-            SELECT wx_id, role, content
-            FROM (
-                SELECT
-                    wx_id,
-                    role,
-                    content,
-                    id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY wx_id
-                        ORDER BY id DESC
-                    ) AS row_num
-                FROM chat_history
-                WHERE wx_id IN ({placeholders})
-            ) ranked
-            WHERE row_num <= ?
-            ORDER BY wx_id ASC, id ASC
-        """
-
         db = await self._get_db()
-        params = [*normalized_ids, limit_val]
-        async with db.execute(sql, tuple(params)) as cursor:
-            rows = await cursor.fetchall()
+        rows = []
+        # Each indexed LIMIT stops before scanning a chat's entire history.
+        # Bound compound-query size below SQLite's default 500-term limit.
+        for offset in range(0, len(normalized_ids), 100):
+            batch = normalized_ids[offset:offset + 100]
+            sql = " UNION ALL ".join(
+                "SELECT * FROM (SELECT wx_id, role, content, id FROM chat_history "
+                "WHERE wx_id = ? ORDER BY id DESC LIMIT ?)"
+                for _ in batch
+            ) + " ORDER BY wx_id ASC, id ASC"
+            params = [value for wx_id in batch for value in (wx_id, limit_val)]
+            async with db.execute(sql, tuple(params)) as cursor:
+                rows.extend(await cursor.fetchall())
 
         context_map: Dict[str, List[dict]] = {
             wx_id: [] for wx_id in normalized_ids

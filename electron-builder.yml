@@ -13,6 +13,9 @@ publish:
 
 files:
   - src/**/*
+  - shared/**/*
+  - LICENSE
+  - THIRD_PARTY_NOTICES.md
   - package.json
   - "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md}"
   - "!**/node_modules/*/{test,__tests__,tests,*.test.js}"

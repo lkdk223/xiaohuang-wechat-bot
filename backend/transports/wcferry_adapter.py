@@ -365,6 +365,8 @@ class WcfMessageItem:
         content = str(getattr(raw, "content", "") or "").strip()
         if msg_type == "image":
             return "[图片]"
+        if msg_type == "emoji":
+            return "[表情包]"
         if msg_type == "voice":
             return content or "[语音]"
         if msg_type == "file":
@@ -768,6 +770,16 @@ class WcferryTransport(BaseTransport):
             "message": "" if status == 0 else f"send_text failed: {status}",
             "receiver": receiver,
         }
+
+    supports_generated_images = True
+
+    def send_image(self, filepath: str, who: Optional[str] = None, exact: bool = True) -> Dict[str, Any]:
+        from backend.core.image_generation import validate_generated_image
+
+        path = validate_generated_image(filepath)
+        receiver = self._resolve_receiver(who or "", exact=True)
+        status = self._wcf_call("send_image", self._wcf.send_image, str(path), receiver)
+        return {"success": status == 0, "code": status, "receiver": receiver}
 
     def send_files(self, filepath: str, who: Optional[str] = None, exact: bool = True) -> Dict[str, Any]:
         receiver = self._resolve_receiver(who or "", exact=exact)

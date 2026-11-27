@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -56,9 +57,24 @@ from .response_cache import ResponseCache, ResponseCacheKey
 from .safety import SafetyGuard
 from .trace_logger import TraceLoggerLite
 
+
+def _collapse_exact_repeated_reply(text: str) -> str:
+    """Collapse one complete answer accidentally emitted twice by a provider."""
+    result = str(text or "").strip()
+    if len(result) < 40:
+        return result
+    for midpoint in range(1, (len(result) // 2) + 2):
+        first = result[:midpoint].rstrip()
+        second = result[midpoint:].lstrip()
+        if len(first) >= 18 and first == second:
+            return first
+    return result
+
 logger = logging.getLogger(__name__)
 _ALLOW_EMPTY_KEY_PLACEHOLDER = "wechat-chat-allow-empty-key"
 _QWEN_RUNTIME_MIN_TIMEOUT_SEC = 15.0
+# ponytail: bounded FIFO; add configurable LRU only if measured reuse warrants it.
+_EMBEDDING_CACHE_MAX_ENTRIES = 256
 _BACKGROUND_GLOBAL_CHAT_ID = "__global__"
 _TASK_EMOTION = "emotion"
 _TASK_CONTACT_PROMPT = "contact_prompt"
@@ -146,6 +162,7 @@ class _DirectOpenAIEmbeddings:
         request_timeout: float,
         max_retries: int,
         default_headers: Optional[Dict[str, str]] = None,
+        runtime: Optional["AgentRuntime"] = None,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -153,6 +170,7 @@ class _DirectOpenAIEmbeddings:
         self.request_timeout = float(request_timeout)
         self.max_retries = max(0, int(max_retries))
         self.default_headers = dict(default_headers or {})
+        self._runtime = runtime
 
     async def aembed_query(self, query: str) -> List[float]:
         url = f"{self.base_url}/embeddings"
@@ -162,7 +180,12 @@ class _DirectOpenAIEmbeddings:
         payload = {"model": self.model, "input": query}
         max_attempts = max(1, self.max_retries + 1)
         last_error: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+        session = (
+            self._runtime._http_session(self.request_timeout)
+            if self._runtime is not None
+            else httpx.AsyncClient(timeout=self.request_timeout)
+        )
+        async with session as client:
             for attempt in range(1, max_attempts + 1):
                 try:
                     response = await client.post(url, headers=headers, json=payload)
@@ -307,6 +330,8 @@ class AgentRuntime:
         self.max_tokens = settings.get("max_tokens")
         self.max_completion_tokens = settings.get("max_completion_tokens")
         self.reasoning_effort = settings.get("reasoning_effort")
+        self.web_search_enabled = bool(self.bot_cfg.get("web_search_enabled", False))
+        self.web_search_always_on = bool(self.bot_cfg.get("web_search_always_on", False))
         self.reply_deadline_sec = as_float(
             self.bot_cfg.get("reply_deadline_sec", 0.0), 0.0, min_value=0.0
         )
@@ -387,6 +412,10 @@ class AgentRuntime:
         self._chat_locks: Dict[str, asyncio.Lock] = {}
         self._embedding_cache: Dict[str, tuple[float, List[float]]] = {}
         self._embedding_pending: Dict[str, asyncio.Future] = {}
+        self._http_clients: Dict[float, Any] = {}
+        self._http_stack = AsyncExitStack()
+        self._http_lock = asyncio.Lock()
+        self._http_closed = False
         self._background_tasks: set[asyncio.Task] = set()
         self._paused_background_task_types: set[str] = set()
         self._runtime_dependencies: Dict[str, Any] = {}
@@ -509,6 +538,7 @@ class AgentRuntime:
         if not self.embedding_model:
             return None
         return self._imports["OpenAIEmbeddings"](
+            runtime=self,
             model=self.embedding_model,
             api_key=self.runtime_api_key,
             base_url=self.base_url or None,
@@ -1066,7 +1096,7 @@ class AgentRuntime:
         url = f"{self.base_url}/messages"
         payload = self._build_anthropic_native_payload(messages, stream=stream)
         headers = self._build_openai_compatible_headers()
-        async with httpx.AsyncClient(timeout=self.effective_timeout_sec) as client:
+        async with self._http_session(self.effective_timeout_sec) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code == 401 and self._force_refresh_auth(reason="anthropic_message_401"):
                 response = await client.post(
@@ -1099,7 +1129,7 @@ class AgentRuntime:
         url = build_anthropic_vertex_request_url(self.base_url, model_id)
         payload = self._build_anthropic_vertex_payload(messages, stream=stream)
         headers = self._build_openai_compatible_headers()
-        async with httpx.AsyncClient(timeout=self.effective_timeout_sec) as client:
+        async with self._http_session(self.effective_timeout_sec) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code == 401 and self._force_refresh_auth(reason="anthropic_vertex_401"):
                 response = await client.post(
@@ -1170,15 +1200,79 @@ class AgentRuntime:
         *,
         stream: bool,
     ) -> Dict[str, Any]:
-        return build_openai_responses_payload(
-            model=self.model,
-            messages=self._serialize_prompt_messages_for_openai(messages),
-            stream=stream,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            max_completion_tokens=self.max_completion_tokens,
-            reasoning_effort=self.reasoning_effort,
+        # ChatGPT's Codex endpoint rejects the public Responses API field
+        # ``max_output_tokens`` and ``temperature``.  Keep the foreground
+        # runtime aligned with the lightweight AIClient health-check path.
+        serialized_messages = self._serialize_prompt_messages_for_openai(messages)
+        force_web_search = self.web_search_enabled and (
+            self.web_search_always_on or self._requires_web_search(serialized_messages)
         )
+        payload = build_openai_responses_payload(
+            model=self.model,
+            messages=serialized_messages,
+            stream=stream,
+            temperature=None,
+            max_tokens=None,
+            max_completion_tokens=None,
+            reasoning_effort=(self.reasoning_effort or ("low" if force_web_search else None)),
+            tools=([{"type": "web_search"}] if force_web_search else None),
+            tool_choice=(
+                "required"
+                if force_web_search
+                else None
+            ),
+        )
+        payload["text"] = {"verbosity": "low"}
+        return payload
+
+    @staticmethod
+    def _requires_web_search(messages: Iterable[Dict[str, Any]]) -> bool:
+        """Force search when the latest user explicitly asks for online/current information."""
+        latest_user_text = ""
+        for item in messages or []:
+            if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                latest_user_text = content
+            elif isinstance(content, list):
+                latest_user_text = " ".join(
+                    str(part.get("text") or "") if isinstance(part, dict) else str(part or "")
+                    for part in content
+                )
+        normalized = latest_user_text.strip().lower()
+        if not normalized:
+            return False
+        explicit_search_markers = (
+            "联网搜索",
+            "联网搜",
+            "上网搜索",
+            "上网搜",
+            "网上搜索",
+            "网上搜",
+            "搜一下",
+            "搜索一下",
+            "帮我搜",
+            "查一下",
+            "查一查",
+            "查查",
+            "帮我查",
+            "web search",
+            "search the web",
+            "look it up",
+        )
+        current_info_markers = (
+            "最新消息",
+            "最新新闻",
+            "今天新闻",
+            "今日新闻",
+            "实时信息",
+            "实时数据",
+            "当前价格",
+            "现在价格",
+            "什么梗",
+        )
+        return any(marker in normalized for marker in explicit_search_markers + current_info_markers)
 
     def _build_google_code_assist_payload(self, messages: Iterable[Any]) -> Dict[str, Any]:
         project_id = str(self.transport_metadata.get("project_id") or "").strip()
@@ -1286,7 +1380,7 @@ class AgentRuntime:
         refresh_reason: str,
     ) -> List[Dict[str, Any]]:
         headers = self._build_openai_compatible_headers()
-        async with httpx.AsyncClient(timeout=self.effective_timeout_sec) as client:
+        async with self._http_session(self.effective_timeout_sec) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code == 401 and self._force_refresh_auth(reason=refresh_reason):
                     refreshed_headers = self._build_openai_compatible_headers()
@@ -1312,6 +1406,14 @@ class AgentRuntime:
             payload=self._build_openai_codex_payload(prepared.prompt_messages, stream=True),
             refresh_reason="codex_responses_401",
         )
+        web_search_used = any(
+            "web_search" in str(event.get("type") or "")
+            for event in events
+            if isinstance(event, dict)
+        )
+        prepared.response_metadata["web_search_used"] = web_search_used
+        if web_search_used:
+            logger.info("Web search completed [%s]", prepared.chat_id)
         return normalize_chat_result(self._normalize_codex_sse_events(events))
 
     async def _invoke_google_code_assist_response(self, prepared: AgentPreparedRequest) -> Any:
@@ -1339,7 +1441,7 @@ class AgentRuntime:
         max_attempts = max(1, int(self.max_retries) + 1)
         last_error: Optional[RuntimeError] = None
 
-        async with httpx.AsyncClient(timeout=self.effective_timeout_sec) as client:
+        async with self._http_session(self.effective_timeout_sec) as client:
             for attempt in range(1, max_attempts + 1):
                 response = None
                 try:
@@ -1463,7 +1565,9 @@ class AgentRuntime:
         source: str,
     ) -> tuple[str, str]:
         self._record_normalized_response_metadata(prepared, normalized)
-        reply_text = str(getattr(normalized, "text", "") or "").strip()
+        reply_text = _collapse_exact_repeated_reply(
+            str(getattr(normalized, "text", "") or "")
+        )
         reasoning_text = str(getattr(normalized, "reasoning", "") or "").strip()
         if reasoning_text:
             self._log_reasoning_output(prepared, reasoning_text, source=source)
@@ -1524,7 +1628,7 @@ class AgentRuntime:
             if not self._is_ollama_runtime():
                 return False
         try:
-            async with httpx.AsyncClient(timeout=min(self.effective_timeout_sec, 20.0)) as client:
+            async with self._http_session(min(self.effective_timeout_sec, 20.0)) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers=self._build_openai_compatible_headers(),
@@ -2294,7 +2398,7 @@ class AgentRuntime:
         if not query or self._embedding_client is None:
             return None
 
-        now = time.time()
+        now = time.monotonic()
         cached = self._embedding_cache.get(query)
         if cached and (self.embedding_cache_ttl_sec <= 0 or now - cached[0] < self.embedding_cache_ttl_sec):
             self._stats["embedding_cache_hits"] += 1
@@ -2303,7 +2407,7 @@ class AgentRuntime:
         pending = self._embedding_pending.get(query)
         if pending is not None:
             try:
-                return await pending
+                return await asyncio.shield(pending)
             except Exception:
                 return None
 
@@ -2317,11 +2421,25 @@ class AgentRuntime:
                 vector = await self._embedding_client.aembed_query(query)
             finally:
                 await self._release_llm_slot(priority)
-            self._embedding_cache[query] = (now, list(vector))
+            completed_at = time.monotonic()
+            if len(self._embedding_cache) >= _EMBEDDING_CACHE_MAX_ENTRIES:
+                if self.embedding_cache_ttl_sec > 0:
+                    expired = [
+                        key for key, (created_at, _) in self._embedding_cache.items()
+                        if completed_at - created_at >= self.embedding_cache_ttl_sec
+                    ]
+                    for key in expired:
+                        self._embedding_cache.pop(key, None)
+                while len(self._embedding_cache) >= _EMBEDDING_CACHE_MAX_ENTRIES:
+                    self._embedding_cache.pop(next(iter(self._embedding_cache)))
+            self._embedding_cache[query] = (completed_at, list(vector))
             future.set_result(list(vector))
             return list(vector)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
         except Exception as exc:
-            future.set_exception(exc)
+            future.set_result(None)
             logger.warning("Embedding 生成失败: %s", exc)
             return None
         finally:
@@ -2337,13 +2455,17 @@ class AgentRuntime:
         *,
         priority: str = "foreground",
     ) -> Optional[str]:
-        prompt_messages = self._build_prompt_messages(
+        prompt_kwargs = dict(
             system_prompt=system_prompt or "",
             memory_context=list(memory_context or []),
             user_text=user_text,
             image_path=image_path,
             event=None,
         )
+        if image_path:
+            prompt_messages = await asyncio.to_thread(self._build_prompt_messages, **prompt_kwargs)
+        else:
+            prompt_messages = self._build_prompt_messages(**prompt_kwargs)
         prepared = AgentPreparedRequest(
             chat_id=chat_id,
             user_text=user_text,
@@ -2353,6 +2475,20 @@ class AgentRuntime:
             image_path=image_path,
         )
         return await self._invoke_prepared(prepared, priority=priority)
+
+    @asynccontextmanager
+    async def _http_session(self, timeout: float):
+        # Keep transport state private to this runtime, not shared across accounts.
+        async with self._http_lock:
+            if self._http_closed:
+                raise RuntimeError("Runtime HTTP clients are closed")
+            client = self._http_clients.get(timeout)
+            if client is None:
+                client = await self._http_stack.enter_async_context(
+                    httpx.AsyncClient(timeout=timeout)
+                )
+                self._http_clients[timeout] = client
+        yield client
 
     async def close(self) -> None:
         if self._batch_runner_task and not self._batch_runner_task.done():
@@ -2371,6 +2507,10 @@ class AgentRuntime:
             if done:
                 await asyncio.gather(*done, return_exceptions=True)
             self._background_tasks.clear()
+        async with self._http_lock:
+            self._http_closed = True
+            await self._http_stack.aclose()
+            self._http_clients.clear()
 
     def get_status(self) -> Dict[str, Any]:
         return {

@@ -188,6 +188,25 @@ def _normalize_binding(binding: Dict[str, Any] | None) -> Dict[str, Any]:
     }
 
 
+def _extract_oauth_binding_metadata(binding: Any) -> Dict[str, Any]:
+    """Accept both legacy metadata-only and projected full-binding payloads."""
+    payload = dict(binding or {}) if isinstance(binding, dict) else {}
+    binding_keys = {
+        "source",
+        "source_type",
+        "credential_source",
+        "sync_policy",
+        "follow_local_auth",
+        "locator_path",
+        "account_label",
+        "account_id",
+        "metadata",
+    }
+    if "metadata" in payload and set(payload).issubset(binding_keys):
+        return dict(payload.get("metadata") or {})
+    return payload
+
+
 def _normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(profile or {})
     normalized["id"] = str(normalized.get("id") or "").strip()
@@ -609,7 +628,9 @@ def _ingest_legacy_candidate(
                         "credential_source": _credential_source_for_method(method.type.value if method else "oauth"),
                         "sync_policy": SyncPolicy.FOLLOW.value if method and method.supports_follow_mode else SyncPolicy.IMPORT_COPY.value,
                         "follow_local_auth": follow_local_auth,
-                        "metadata": dict(normalized.get("oauth_binding") or {}),
+                        "metadata": _extract_oauth_binding_metadata(
+                            normalized.get("oauth_binding")
+                        ),
                     },
                     "metadata": {
                         **dict(entry["metadata"]),

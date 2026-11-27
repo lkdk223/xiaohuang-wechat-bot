@@ -349,12 +349,17 @@ def build_openai_chat_payload(
     return payload
 
 
-def _normalize_responses_content_parts(value: Any) -> List[Dict[str, Any]]:
+def _normalize_responses_content_parts(
+    value: Any,
+    *,
+    assistant_output: bool = False,
+) -> List[Dict[str, Any]]:
+    text_type = "output_text" if assistant_output else "input_text"
     if value is None:
         return []
     if isinstance(value, str):
         text = value.strip()
-        return [{"type": "input_text", "text": text}] if text else []
+        return [{"type": text_type, "text": text}] if text else []
     if isinstance(value, list):
         parts: List[Dict[str, Any]] = []
         for item in value:
@@ -363,9 +368,11 @@ def _normalize_responses_content_parts(value: Any) -> List[Dict[str, Any]]:
                 if item_type == "text":
                     text = str(item.get("text") or "").strip()
                     if text:
-                        parts.append({"type": "input_text", "text": text})
+                        parts.append({"type": text_type, "text": text})
                     continue
                 if item_type == "image_url":
+                    if assistant_output:
+                        continue
                     image_payload = item.get("image_url")
                     if isinstance(image_payload, dict):
                         url = str(image_payload.get("url") or "").strip()
@@ -374,14 +381,14 @@ def _normalize_responses_content_parts(value: Any) -> List[Dict[str, Any]]:
                     continue
                 text = str(item.get("text") or "").strip()
                 if text:
-                    parts.append({"type": "input_text", "text": text})
+                    parts.append({"type": text_type, "text": text})
                 continue
             text = str(item or "").strip()
             if text:
-                parts.append({"type": "input_text", "text": text})
+                parts.append({"type": text_type, "text": text})
         return parts
     text = str(value).strip()
-    return [{"type": "input_text", "text": text}] if text else []
+    return [{"type": text_type, "text": text}] if text else []
 
 
 def build_openai_responses_payload(
@@ -393,6 +400,8 @@ def build_openai_responses_payload(
     max_tokens: Optional[int] = None,
     max_completion_tokens: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
+    tools: Optional[Iterable[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
 ) -> Dict[str, Any]:
     instructions: List[str] = []
     input_items: List[Dict[str, Any]] = []
@@ -401,7 +410,10 @@ def build_openai_responses_payload(
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
-        content_parts = _normalize_responses_content_parts(item.get("content"))
+        content_parts = _normalize_responses_content_parts(
+            item.get("content"),
+            assistant_output=role == "assistant",
+        )
         if not content_parts:
             continue
         if role == "system":
@@ -443,6 +455,10 @@ def build_openai_responses_payload(
             "summary": "auto",
         }
         payload["include"] = ["reasoning.encrypted_content"]
+    if tools:
+        payload["tools"] = list(tools)
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     return payload
 
 

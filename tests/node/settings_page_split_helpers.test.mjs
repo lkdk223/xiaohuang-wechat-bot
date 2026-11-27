@@ -313,7 +313,7 @@ test('runtime-sync loadSettings preserves file and live config source versions',
     }
 });
 
-test('runtime-sync loadSettings schedules a silent refresh while local auth sync is still running', async () => {
+test('runtime-sync local auth refresh preserves pending form edits', async () => {
     const originalGetConfig = apiService.getConfig;
     const originalSetTimeout = globalThis.setTimeout;
     const originalClearTimeout = globalThis.clearTimeout;
@@ -367,6 +367,8 @@ test('runtime-sync loadSettings schedules a silent refresh while local auth sync
                 _localAuthSyncRefreshTimer: null,
                 _localAuthSyncRefreshAttempt: 0,
                 _isSaving: false,
+                _hasPendingChanges: false,
+                _pendingConfigReload: false,
                 isActive() {
                     return true;
                 },
@@ -407,10 +409,12 @@ test('runtime-sync loadSettings schedules a silent refresh while local auth sync
             assert.equal(timers.length, 1);
             assert.equal(timers[0].delay, 600);
 
+            page._hasPendingChanges = true;
             timers[0].callback();
             await Promise.resolve();
 
-            assert.deepEqual(reloadOptions, { silent: true, preserveFeedback: true });
+            assert.equal(reloadOptions, null);
+            assert.equal(page._pendingConfigReload, true);
             assert.deepEqual(cleared, []);
         });
     } finally {
@@ -467,6 +471,51 @@ test('runtime-sync defers config reload while settings page is inactive', async 
     }
 });
 
+test('runtime-sync defers config reload while the active settings form is dirty', async () => {
+    const previousWindow = globalThis.window;
+    let changeHandler = null;
+
+    globalThis.window = {
+        electronAPI: {
+            configSubscribe() {
+                return Promise.resolve();
+            },
+            onConfigChanged(handler) {
+                changeHandler = handler;
+                return () => {};
+            },
+        },
+    };
+
+    try {
+        let loadCalls = 0;
+        const page = {
+            _removeConfigListener: null,
+            _isSaving: false,
+            _hasPendingChanges: true,
+            _pendingConfigReload: false,
+            isActive() {
+                return true;
+            },
+            async loadSettings() {
+                loadCalls += 1;
+            },
+        };
+
+        watchConfigChanges(page);
+        changeHandler?.();
+
+        assert.equal(page._pendingConfigReload, true);
+        assert.equal(loadCalls, 0);
+    } finally {
+        if (previousWindow === undefined) {
+            delete globalThis.window;
+        } else {
+            globalThis.window = previousWindow;
+        }
+    }
+});
+
 test('settings page onEnter reloads when a background config change is pending', async () => {
     const page = new SettingsPage();
     const calls = [];
@@ -492,6 +541,31 @@ test('settings page onEnter reloads when a background config change is pending',
         { preserveFeedback: true },
         'backups',
     ]);
+});
+
+test('settings page onEnter preserves pending edits instead of applying a queued reload', async () => {
+    const page = new SettingsPage();
+    const calls = [];
+
+    page._loaded = true;
+    page._hasPendingChanges = true;
+    page._pendingConfigReload = true;
+    page._handleMainScroll = () => {};
+    page._loadWorkspaceBackups = async () => {
+        calls.push('backups');
+    };
+    page.loadSettings = async () => {
+        calls.push('reload');
+    };
+    page._renderHero = () => {
+        calls.push('hero');
+    };
+    page.getState = () => 0;
+
+    await page.onEnter();
+
+    assert.deepEqual(calls, ['hero', 'backups']);
+    assert.equal(page._pendingConfigReload, true);
 });
 
 test('settings page onEnter reloads when local auth sync is still refreshing', async () => {
@@ -1623,6 +1697,21 @@ test('settings shell keeps workbench structure balanced for section switching', 
     const markup = renderSettingsPageShell();
     assert.equal(markup.includes('id="settings-section-nav"'), true);
     assert.equal((markup.match(/<div\b/g) || []).length, (markup.match(/<\/div>/g) || []).length);
+});
+
+test('settings shell exposes on-demand web search controls', () => {
+    const markup = renderSettingsPageShell();
+
+    assert.equal(markup.includes('id="setting-web-search-enabled"'), true);
+    assert.equal(markup.includes('id="setting-web-search-always-on"'), true);
+    assert.equal(markup.includes('允许按需联网搜索'), true);
+});
+
+test('settings shell exposes natural chat mode control', () => {
+    const markup = renderSettingsPageShell();
+
+    assert.equal(markup.includes('id="setting-natural-chat-mode"'), true);
+    assert.equal(markup.includes('启用熟人群聊风格'), true);
 });
 
 test('settings shell removes duplicated model summary block from config center', () => {

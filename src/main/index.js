@@ -983,11 +983,22 @@ if (!app.requestSingleInstanceLock()) {
         safeSetupIPC();
 
         // 3. 预热共享配置，但不自动拉起 Python 服务
-        SharedConfigService.ensureLoaded().catch(err => console.error('Config preload error:', err));
+        const configReady = SharedConfigService.ensureLoaded().catch(err => {
+            console.error('Config preload error:', err);
+        });
 
         // 4. 创建主窗口 (后台加载，ready-to-show 时自动切换)
         WindowManager.createMain();
         WindowManager.createTray();
+
+        // Development/diagnostic launches may request one scoped automatic
+        // start without weakening the authenticated local API or changing the
+        // normal desktop startup behavior.
+        if (process.env.WECHAT_BOT_AUTO_START === '1') {
+            configReady.then(() => RuntimeManager.startBot()).catch(err => {
+                console.error('[Runtime] requested auto-start failed:', err);
+            });
+        }
 
         GLOBAL_STATE.updateManager = new UpdateManager({
             app,

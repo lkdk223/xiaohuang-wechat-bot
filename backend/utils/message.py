@@ -15,6 +15,7 @@ VOICE_TYPE_MARKERS: frozenset = frozenset(("voice", "audio"))
 
 DEFAULT_SUFFIX = "\n（由AI回复，模型使用{alias}）"
 EMOJI_PLACEHOLDER = "[表情]"
+STICKER_PLACEHOLDER = "[表情包]"
 VOICE_PLACEHOLDER = "[语音]"
 STREAM_PUNCTUATION: frozenset = frozenset("。！？.!?；;\n")
 
@@ -168,12 +169,18 @@ __all__ = [
     "VOICE_TYPE_MARKERS",
     "DEFAULT_SUFFIX",
     "EMOJI_PLACEHOLDER",
+    "STICKER_PLACEHOLDER",
     "VOICE_PLACEHOLDER",
     "STREAM_PUNCTUATION",
     "EMOJI_REPLACEMENTS",
     "EMOJI_PATTERN",
     "split_group_message",
     "is_text_message",
+    "is_image_message",
+    "is_sticker_message",
+    "is_visual_message",
+    "build_visual_user_prompt",
+    "extract_visual_chat_reply",
     "is_voice_message",
     "parse_voice_to_text_result",
     "is_at_me",
@@ -181,6 +188,7 @@ __all__ = [
     "build_reply_suffix",
     "refine_reply_text",
     "sanitize_reply_text",
+    "strip_trailing_visual_reply_emoji",
     "split_reply_chunks",
     "split_reply_naturally",
 ]
@@ -210,8 +218,8 @@ def is_text_message(msg_type: Optional[str], content: str) -> bool:
     
     t = str(msg_type).lower()
     
-    # 图片被视为文本消息的一种（为了通过过滤器）
-    if "image" in t or "pic" in t:
+    # 视觉消息会在后续保存为图片并交给多模态模型。
+    if is_visual_message(t):
         return True
 
     for marker in NON_TEXT_TYPE_MARKERS:
@@ -230,6 +238,56 @@ def is_image_message(msg_type: Optional[str]) -> bool:
         return False
     t = str(msg_type).lower()
     return "image" in t or "pic" in t
+
+
+def is_sticker_message(msg_type: Optional[str]) -> bool:
+    """判断是否为微信表情包、动画表情或 GIF 消息。"""
+    if msg_type is None:
+        return False
+    text_type = str(msg_type).lower()
+    return any(marker in text_type for marker in ("emoji", "sticker", "gif", "emoticon"))
+
+
+def is_visual_message(msg_type: Optional[str]) -> bool:
+    """判断消息是否可以复用图片多模态识别链路。"""
+    return is_image_message(msg_type) or is_sticker_message(msg_type)
+
+
+def build_visual_user_prompt(user_text: str) -> str:
+    """为普通图片和表情包生成适合聊天回复的视觉提示。"""
+    text = str(user_text or "").strip()
+    if STICKER_PLACEHOLDER in text or EMOJI_PLACEHOLDER in text:
+        return (
+            f"{text or STICKER_PLACEHOLDER}\n"
+            "请识别这张表情包的画面、文字、情绪和交流意图，并结合聊天语境自然回应；"
+            "先在内部完成理解，最终只输出一段可直接发给对方的自然回复。"
+            "不要输出图片描述、分析过程或‘你可以回/建议回复’等前缀。"
+        )
+    return text or (
+        "请理解这张图片的内容，并结合聊天语境自然回应。"
+        "最终只输出可直接发送的回复，不要输出图片描述或分析过程。"
+    )
+
+
+_VISUAL_REPLY_MARKER = re.compile(
+    r"(?:你可以回|可以回|建议回复|回复建议|建议回)[\s：:]*",
+    re.I,
+)
+
+
+def extract_visual_chat_reply(text: str) -> str:
+    """从视觉模型输出中提取可直接发送的聊天回复。
+
+    部分多模态模型会先输出画面分析，再以“你可以回：”给出答案。
+    发送层只保留最后一个明确的回复候选，避免把分析过程发到微信。
+    """
+    original = str(text or "").strip()
+    if not original:
+        return original
+    matches = list(_VISUAL_REPLY_MARKER.finditer(original))
+    candidate = original[matches[-1].end() :].strip() if matches else original
+    candidate = candidate.strip("`\"'“”‘’ ")
+    return refine_reply_text(candidate)
 
 
 def is_voice_message(msg_type: Optional[str]) -> bool:
@@ -301,7 +359,46 @@ def refine_reply_text(text: str) -> str:
     for pattern in HUMANIZE_PATTERNS:
         result = pattern.sub("", result).strip()
     result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    # Some streaming/provider responses occasionally concatenate the complete
+    # answer twice with a single newline.  Compare every possible midpoint
+    # after trimming only the boundary whitespace; this covers multi-line
+    # blocks without collapsing intentional short repeats such as “哈哈”.
+    if len(result) >= 40:
+        for midpoint in range(1, (len(result) // 2) + 2):
+            first = result[:midpoint].rstrip()
+            second = result[midpoint:].lstrip()
+            if len(first) >= 18 and first == second:
+                result = first
+                break
+    if len(result) >= 40:
+        for separator in ("\n\n", "\n"):
+            parts = [part.strip() for part in result.split(separator)]
+            if len(parts) == 2 and parts[0] == parts[1]:
+                result = parts[0]
+                break
+        if len(result) % 2 == 0:
+            midpoint = len(result) // 2
+            if result[:midpoint].strip() == result[midpoint:].strip():
+                result = result[:midpoint].strip()
     return result if result else original
+
+
+def strip_trailing_visual_reply_emoji(text: str) -> str:
+    """Remove only a trailing Unicode emoji cluster from a visual reply."""
+    result = str(text or "").rstrip()
+    index = len(result)
+    found_emoji = False
+    while index > 0:
+        char = result[index - 1]
+        if char.isspace() or char in {"\uFE0F", "\uFE0E", "\u200D"}:
+            index -= 1
+            continue
+        if EMOJI_PATTERN.fullmatch(char):
+            found_emoji = True
+            index -= 1
+            continue
+        break
+    return result[:index].rstrip() if found_emoji else result
 
 
 def sanitize_reply_text(

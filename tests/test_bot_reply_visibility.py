@@ -130,6 +130,88 @@ async def test_send_smart_reply_fast_mode_skips_natural_split():
     assert sent == "done[bot]"
 
 
+@pytest.mark.asyncio
+async def test_send_smart_reply_does_not_expose_visual_analysis():
+    bot = WeChatBot("config.yaml")
+    bot.wx_lock = asyncio.Lock()
+    bot.last_reply_ts = {"ts": 0.0}
+    bot.bot_cfg = {
+        "reply_chunk_size": 500,
+        "reply_chunk_delay_sec": 0.0,
+        "min_reply_interval_sec": 0.0,
+        "emoji_policy": "keep",
+        "reply_suffix": "",
+    }
+    event = SimpleNamespace(
+        chat_name="测试群",
+        content="[表情包]",
+        sender="群成员",
+        raw_item=None,
+        msg_type="emoji",
+    )
+    response = "这是一张撒娇表情包。\n\n你可以回：抱抱你～"
+
+    with patch("backend.bot.send_reply_chunks", new=AsyncMock(return_value=(True, None))) as mock_send_chunks:
+        sent = await bot._send_smart_reply(MagicMock(), event, response)
+
+    assert mock_send_chunks.await_args.args[2] == "抱抱你～"
+    assert sent == "抱抱你～"
+
+
+@pytest.mark.asyncio
+async def test_send_smart_reply_strips_only_trailing_emoji_for_visual_input():
+    bot = WeChatBot("config.yaml")
+    bot.wx_lock = asyncio.Lock()
+    bot.last_reply_ts = {"ts": 0.0}
+    bot.bot_cfg = {
+        "reply_chunk_size": 500,
+        "reply_chunk_delay_sec": 0.0,
+        "min_reply_interval_sec": 0.0,
+        "emoji_policy": "keep",
+        "reply_suffix": "",
+    }
+    event = SimpleNamespace(
+        chat_name="测试群",
+        content="[图片]",
+        sender="群成员",
+        raw_item=None,
+        msg_type="image",
+    )
+
+    with patch("backend.bot.send_reply_chunks", new=AsyncMock(return_value=(True, None))) as mock_send_chunks:
+        sent = await bot._send_smart_reply(MagicMock(), event, "这张真有意思 😅")
+
+    assert mock_send_chunks.await_args.args[2] == "这张真有意思"
+    assert sent == "这张真有意思"
+
+
+@pytest.mark.asyncio
+async def test_send_smart_reply_keeps_emoji_for_text_input():
+    bot = WeChatBot("config.yaml")
+    bot.wx_lock = asyncio.Lock()
+    bot.last_reply_ts = {"ts": 0.0}
+    bot.bot_cfg = {
+        "reply_chunk_size": 500,
+        "reply_chunk_delay_sec": 0.0,
+        "min_reply_interval_sec": 0.0,
+        "emoji_policy": "keep",
+        "reply_suffix": "",
+    }
+    event = SimpleNamespace(
+        chat_name="测试群",
+        content="真的吗",
+        sender="群成员",
+        raw_item=None,
+        msg_type="text",
+    )
+
+    with patch("backend.bot.send_reply_chunks", new=AsyncMock(return_value=(True, None))) as mock_send_chunks:
+        sent = await bot._send_smart_reply(MagicMock(), event, "真的 😅")
+
+    assert mock_send_chunks.await_args.args[2] == "真的 😅"
+    assert sent == "真的 😅"
+
+
 def test_build_final_reply_text_uses_suffix_after_sanitizing():
     bot = WeChatBot("config.yaml")
     bot.bot_cfg = {
@@ -139,6 +221,36 @@ def test_build_final_reply_text_uses_suffix_after_sanitizing():
     bot.ai_client = SimpleNamespace(model="test-model")
 
     assert bot._build_final_reply_text("hi😀") == "hi[bot]"
+
+
+def test_build_final_reply_text_replaces_deprecated_self_names_before_send():
+    bot = WeChatBot("config.yaml")
+    bot.bot_cfg = {
+        "self_name": "小黄",
+        "self_name_aliases": ["知有", "ikun"],
+        "emoji_policy": "keep",
+        "reply_suffix": "",
+    }
+    bot.ai_client = SimpleNamespace(model="test-model")
+
+    assert bot._build_final_reply_text("我是知有，也叫ikun") == "我是小黄，也叫小黄"
+
+
+def test_build_final_reply_text_collapses_repeated_multiline_answer():
+    bot = WeChatBot("config.yaml")
+    bot.bot_cfg = {"emoji_policy": "keep", "reply_suffix": ""}
+    bot.ai_client = SimpleNamespace(model="test-model")
+    block = "公开层面就是合作、分歧、后续各自发声明，网传细节别当真。\n我按时间线给你说。"
+
+    assert bot._build_final_reply_text(f"{block}\n{block}") == block
+
+
+def test_build_final_reply_text_keeps_intentional_short_repetition():
+    bot = WeChatBot("config.yaml")
+    bot.bot_cfg = {"emoji_policy": "keep", "reply_suffix": ""}
+    bot.ai_client = SimpleNamespace(model="test-model")
+
+    assert bot._build_final_reply_text("哈哈") == "哈哈"
 
 
 def test_get_natural_split_config_normalizes_reversed_delay_range():

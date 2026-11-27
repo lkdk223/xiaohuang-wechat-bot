@@ -11,10 +11,12 @@ from ..utils.message import (
     is_text_message,
     is_voice_message,
     is_image_message,
+    is_sticker_message,
     split_group_message,
     is_at_me,
     strip_at_text,
     VOICE_PLACEHOLDER,
+    STICKER_PLACEHOLDER,
 )
 
 __all__ = [
@@ -153,6 +155,8 @@ def normalize_message_item(
     if is_voice_message(msg_type):
         if not content:
             content = VOICE_PLACEHOLDER
+    elif is_sticker_message(msg_type):
+        content = STICKER_PLACEHOLDER
     elif is_image_message(msg_type):
         content = "[图片]"
     elif not is_text_message(msg_type, content):

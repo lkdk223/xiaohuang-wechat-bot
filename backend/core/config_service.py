@@ -29,7 +29,6 @@ _REMOVED_CONFIG_PATHS = {
     "agent.streaming_enabled",
     "bot.capability_strict",
     "bot.compat_ui_enabled",
-    "bot.transport_backend",
     "bot.history_log_interval_sec",
     "bot.memory_seed_group",
     "bot.memory_seed_limit",

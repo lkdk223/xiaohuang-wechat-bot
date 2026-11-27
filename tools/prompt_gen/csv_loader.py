@@ -53,7 +53,7 @@ def parse_timestamp(raw_value: str) -> datetime:
     return datetime.now()
 
 
-def load_chat_from_csv(csv_path: str, self_name: str = "知有") -> List[Dict[str, Any]]:
+def load_chat_from_csv(csv_path: str, self_name: str = "小黄") -> List[Dict[str, Any]]:
     """
     从 CSV 文件加载聊天记录。
 

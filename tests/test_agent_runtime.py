@@ -5,13 +5,352 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.core.agent_runtime import AgentRuntime
+from backend.core.agent_runtime import AgentRuntime, _collapse_exact_repeated_reply
 from backend.core.provider_compat import NormalizedChatResult, NormalizedToolCall
 
 
 class _FakeMessage:
     def __init__(self, content):
         self.content = content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnect_first", [False, True])
+async def test_runtime_chat_reuses_real_connection_with_fresh_headers(monkeypatch, disconnect_first):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    writers, handlers, received = [], [], []
+    disconnected = asyncio.Event()
+
+    async def handle(reader, writer):
+        writers.append(writer)
+        handlers.append(asyncio.current_task())
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                lines = head.decode().split("\r\n")
+                headers = dict(line.split(": ", 1) for line in lines[1:] if ": " in line)
+                headers = {key.lower(): value for key, value in headers.items()}
+                await reader.readexactly(int(headers.get("content-length", 0)))
+                received.append(headers["authorization"])
+                if disconnect_first and len(received) == 1:
+                    return
+                body = b'{"choices":[{"message":{"content":"ok"}}]}'
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            disconnected.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    runtime = AgentRuntime(
+        settings={"base_url": f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1",
+                  "api_key": "first", "model": "test", "max_retries": 0, "timeout_sec": 2},
+        bot_cfg={}, agent_cfg={"enabled": True},
+    )
+    try:
+        if disconnect_first:
+            with pytest.raises(RuntimeError):
+                await runtime._post_chat_completions_raw(
+                    {"model": "test", "messages": []}, refresh_reason="test",
+                )
+        for token in ["first", "second"]:
+            runtime.api_key = token
+            result = await runtime._post_chat_completions_raw(
+                {"model": "test", "messages": []}, refresh_reason="test",
+            )
+            assert result["choices"][0]["message"]["content"] == "ok"
+        assert received == (["Bearer first"] if disconnect_first else []) + ["Bearer first", "Bearer second"]
+        assert len(writers) == (2 if disconnect_first else 1)
+        await runtime.close()
+        await asyncio.wait_for(disconnected.wait(), 2)
+    finally:
+        await runtime.close()
+        server.close()
+        await server.wait_closed()
+        for writer in writers:
+            writer.close()
+        for task in handlers:
+            task.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_embeddings_reuse_runtime_http_client(monkeypatch):
+    import httpx
+    from backend.core import agent_runtime
+
+    clients, requests = [], []
+    original_client = httpx.AsyncClient
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"embedding": [1.0]}]})
+
+    def build_client(**kwargs):
+        client = original_client(transport=httpx.MockTransport(respond), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(agent_runtime.httpx, "AsyncClient", build_client)
+    runtime = AgentRuntime(
+        settings={"base_url": "https://example.com/v1", "api_key": "test-key",
+                  "model": "test", "embedding_model": "embed", "timeout_sec": 7},
+        bot_cfg={}, agent_cfg={"enabled": True},
+    )
+    try:
+        assert await runtime.get_embedding("first") == [1.0]
+        assert await runtime.get_embedding("second") == [1.0]
+        assert len(clients) == 1 and len(requests) == 2
+        assert not clients[0].is_closed
+        assert clients[0].timeout.read == 7
+        assert all(request.headers["Authorization"] == "Bearer test-key" for request in requests)
+        assert all(request.url.path == "/v1/embeddings" for request in requests)
+    finally:
+        await runtime.close()
+    assert clients[0].is_closed
+
+
+@pytest.mark.asyncio
+async def test_runtime_http_sessions_reuse_and_close():
+    runtime = AgentRuntime(
+        settings={"base_url": "https://example.com/v1", "api_key": "test", "model": "test"},
+        bot_cfg={}, agent_cfg={"enabled": True},
+    )
+    try:
+        async with runtime._http_session(10) as first:
+            async with runtime._http_session(10) as second:
+                assert first is second
+        assert not first.is_closed
+        async with runtime._http_session(2) as short:
+            assert short is not first
+        await runtime.close()
+        assert first.is_closed and short.is_closed
+        assert not runtime._http_clients
+        await runtime.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            async with runtime._http_session(10):
+                pytest.fail("closed runtime reopened an HTTP client")
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_owner", [False, True])
+async def test_embedding_pending_cancellation_is_isolated(cancel_owner):
+    from unittest.mock import AsyncMock
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def embed(query):
+        started.set()
+        await release.wait()
+        return [1.0]
+
+    runtime = SimpleNamespace(
+        _refresh_runtime_auth_clients=lambda: None,
+        _embedding_client=SimpleNamespace(aembed_query=embed),
+        _embedding_cache={}, _embedding_pending={}, embedding_cache_ttl_sec=300,
+        _stats={"embedding_cache_hits": 0, "embedding_cache_misses": 0},
+        _acquire_llm_slot=AsyncMock(), _release_llm_slot=AsyncMock(),
+    )
+    owner = asyncio.create_task(AgentRuntime.get_embedding(runtime, "test"))
+    tasks = [owner]
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        waiter = asyncio.create_task(AgentRuntime.get_embedding(runtime, "test"))
+        survivor = asyncio.create_task(AgentRuntime.get_embedding(runtime, "test"))
+        tasks.extend([waiter, survivor])
+        await asyncio.sleep(0)
+        target = owner if cancel_owner else waiter
+        target.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await target
+        if cancel_owner:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(survivor), 0.2)
+        else:
+            release.set()
+            assert await asyncio.wait_for(survivor, 1) == [1.0]
+            assert await owner == [1.0]
+        assert not runtime._embedding_pending
+        runtime._release_llm_slot.assert_awaited_once()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_image_prompt_build_runs_off_event_loop(monkeypatch):
+    import threading
+    from backend.core import agent_runtime_prepare as prepare
+
+    loop_thread = threading.get_ident()
+    monkeypatch.setattr(prepare, "resolve_system_prompt", lambda *args: "system")
+    def build(*args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        return ["image prompt"]
+    monkeypatch.setattr(prepare, "build_prompt_messages", build)
+    result = await prepare.build_prompt_node(SimpleNamespace(bot_cfg={}), {
+        "event": None, "user_text": "image", "image_path": "synthetic.png",
+    })
+    assert result["prompt_messages"] == ["image prompt"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_settles_waiters_and_allows_retry():
+    from unittest.mock import AsyncMock
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def fail(query):
+        started.set()
+        await release.wait()
+        raise RuntimeError("synthetic embedding failure")
+
+    runtime = SimpleNamespace(
+        _refresh_runtime_auth_clients=lambda: None,
+        _embedding_client=SimpleNamespace(aembed_query=fail),
+        _embedding_cache={}, _embedding_pending={}, embedding_cache_ttl_sec=300,
+        _stats={"embedding_cache_hits": 0, "embedding_cache_misses": 0},
+        _acquire_llm_slot=AsyncMock(), _release_llm_slot=AsyncMock(),
+    )
+    tasks = [asyncio.create_task(AgentRuntime.get_embedding(runtime, "test"))]
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        shared = runtime._embedding_pending["test"]
+        tasks.append(asyncio.create_task(AgentRuntime.get_embedding(runtime, "test")))
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.wait_for(asyncio.gather(*tasks), 1) == [None, None]
+        assert shared.done() and shared.exception() is None
+        assert not runtime._embedding_cache and not runtime._embedding_pending
+        runtime._embedding_client.aembed_query = AsyncMock(return_value=[2.0])
+        assert await AgentRuntime.get_embedding(runtime, "test") == [2.0]
+        assert runtime._release_llm_slot.await_count == 2
+        assert runtime._stats["embedding_cache_misses"] == 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_embedding_cache_has_bounded_capacity(monkeypatch):
+    from unittest.mock import AsyncMock
+    from backend.core import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "_EMBEDDING_CACHE_MAX_ENTRIES", 3)
+    monkeypatch.setattr(agent_runtime, "time", SimpleNamespace(monotonic=lambda: 100))
+    runtime = SimpleNamespace(
+        _refresh_runtime_auth_clients=lambda: None,
+        _embedding_client=SimpleNamespace(aembed_query=AsyncMock(return_value=[1.0])),
+        _embedding_cache={}, _embedding_pending={}, embedding_cache_ttl_sec=0,
+        _stats={"embedding_cache_hits": 0, "embedding_cache_misses": 0},
+        _acquire_llm_slot=AsyncMock(), _release_llm_slot=AsyncMock(),
+    )
+    for query in ["old", "second", "third", "new"]:
+        assert await AgentRuntime.get_embedding(runtime, query) == [1.0]
+    assert list(runtime._embedding_cache) == ["second", "third", "new"]
+    # At capacity, expired entries are reclaimed before live entries.
+    runtime.embedding_cache_ttl_sec = 10
+    runtime._embedding_cache["third"] = (0, [1.0])
+    await AgentRuntime.get_embedding(runtime, "latest")
+    assert list(runtime._embedding_cache) == ["second", "new", "latest"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_ttl_starts_after_slow_generation(monkeypatch):
+    from unittest.mock import AsyncMock
+    from backend.core import agent_runtime
+
+    tick = [100.0]
+    monkeypatch.setattr(agent_runtime, "time", SimpleNamespace(
+        time=lambda: tick[0], monotonic=lambda: tick[0],
+    ))
+
+    async def slow_embed(query):
+        tick[0] += 20
+        return [1.0]
+
+    embedding = AsyncMock(side_effect=slow_embed)
+    runtime = SimpleNamespace(
+        _refresh_runtime_auth_clients=lambda: None,
+        _embedding_client=SimpleNamespace(aembed_query=embedding),
+        _embedding_cache={}, _embedding_pending={}, embedding_cache_ttl_sec=10,
+        _stats={"embedding_cache_hits": 0, "embedding_cache_misses": 0},
+        _acquire_llm_slot=AsyncMock(), _release_llm_slot=AsyncMock(),
+    )
+    assert await AgentRuntime.get_embedding(runtime, "test") == [1.0]
+    tick[0] += 9
+    assert await AgentRuntime.get_embedding(runtime, "test") == [1.0]
+    assert embedding.await_count == 1
+    tick[0] += 1
+    assert await AgentRuntime.get_embedding(runtime, "test") == [1.0]
+    assert embedding.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_context_survives_exhausted_prepare_budget():
+    from backend.core.agent_runtime_prepare import resolve_context_task
+
+    async def ready():
+        return {"nickname": "Alice"}
+
+    task = asyncio.create_task(ready())
+    await task
+    skipped = []
+    result = await resolve_context_task(
+        SimpleNamespace(prepare_soft_budget_sec=0), task,
+        step_name="user_profile", started=0,
+        skipped_context_steps=skipped, warning_message="profile failed",
+    )
+    assert result == {"nickname": "Alice"}
+    assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_context_load_cleans_up_parallel_tasks():
+    from backend.core.agent_runtime_prepare import load_context_node
+
+    children = []
+    started = asyncio.Event()
+
+    async def blocked(*args):
+        children.append(asyncio.current_task())
+        if len(children) == 2:
+            started.set()
+        await asyncio.Event().wait()
+
+    runtime = SimpleNamespace(
+        bot_cfg={"memory_context_limit": 5, "personalization_enabled": True},
+        prepare_soft_budget_sec=60,
+    )
+    parent = asyncio.create_task(load_context_node(runtime, {
+        "event": None, "chat_id": "test", "user_text": "hello",
+        "dependencies": {"memory": SimpleNamespace(
+            get_recent_context=blocked, get_profile_prompt_snapshot=blocked,
+        )},
+    }))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        parent.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+        assert all(child.done() for child in children)
+    finally:
+        parent.cancel()
+        for child in children:
+            child.cancel()
+        await asyncio.gather(parent, *children, return_exceptions=True)
+
+
+def test_agent_runtime_collapses_complete_repeated_provider_reply():
+    block = "我先把前因讲清楚，再按时间顺序说后面发生的事。"
+
+    assert _collapse_exact_repeated_reply(f"{block}\n{block}") == block
 
 
 class _ReasoningMessage:
@@ -282,6 +621,53 @@ def _fake_integrations(self):
         "ChatOpenAI": _FakeChatOpenAI,
         "OpenAIEmbeddings": _FakeOpenAIEmbeddings,
     }
+
+
+def test_agent_runtime_forces_web_search_for_explicit_search_requests():
+    assert AgentRuntime._requires_web_search(
+        [{"role": "user", "content": "联网搜索哈基米是什么意思"}]
+    ) is True
+    assert AgentRuntime._requires_web_search(
+        [{"role": "user", "content": "哈基米是什么梗"}]
+    ) is True
+    assert AgentRuntime._requires_web_search(
+        [{"role": "user", "content": "你好呀"}]
+    ) is False
+
+
+def test_agent_runtime_openai_codex_payload_enables_on_demand_web_search(monkeypatch):
+    monkeypatch.setattr(AgentRuntime, "_load_integrations", _fake_integrations)
+    runtime = AgentRuntime(
+        settings={
+            "base_url": "https://chatgpt.com/backend-api",
+            "api_key": "test-token",
+            "auth_transport": "openai_codex_responses",
+            "provider_id": "openai",
+            "model": "gpt-5.4-mini",
+        },
+        bot_cfg={
+            "web_search_enabled": True,
+            "web_search_always_on": False,
+            "natural_chat_mode": True,
+        },
+        agent_cfg={"enabled": True},
+    )
+
+    search_payload = runtime._build_openai_codex_payload(
+        [{"role": "user", "content": "帮我搜一下今天的新闻"}],
+        stream=True,
+    )
+    chat_payload = runtime._build_openai_codex_payload(
+        [{"role": "user", "content": "你好呀"}],
+        stream=True,
+    )
+
+    assert search_payload["tools"] == [{"type": "web_search"}]
+    assert search_payload["tool_choice"] == "required"
+    assert search_payload["reasoning"]["effort"] == "low"
+    assert search_payload["text"]["verbosity"] == "low"
+    assert "tools" not in chat_payload
+    assert "tool_choice" not in chat_payload
 
 
 @pytest.mark.asyncio

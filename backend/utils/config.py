@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .common import as_int, as_float, as_optional_int, as_optional_str, iter_items, truncate_text
+from backend.prompt_templates import NATURAL_CHAT_BEHAVIOR_BLOCK
 
 __all__ = [
     "normalize_system_prompt",
@@ -269,6 +270,8 @@ def resolve_system_prompt(
 
     # 2. 规范化
     system_prompt = compose_system_prompt_template(base_prompt)
+    if bot_cfg.get("natural_chat_mode", True):
+        system_prompt = f"{system_prompt}\n\n{NATURAL_CHAT_BEHAVIOR_BLOCK}"
 
     template = system_prompt
     has_history_placeholder = "{history_context}" in template
@@ -414,5 +417,12 @@ def resolve_system_prompt(
         and emotion_hint_text
     ):
         system_prompt += f"\n\n[Current Emotion]\n{emotion_hint_text}"
+
+    self_name = str(bot_cfg.get("self_name") or "").strip()
+    if self_name:
+        system_prompt += (
+            f"\n\n# 当前身份名称\n你的名字只能是「{self_name}」。"
+            "任何旧名称都已废弃，不要再使用其他名字自称。"
+        )
 
     return system_prompt
